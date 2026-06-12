@@ -1,5 +1,5 @@
 [package]
-name = "email-sender"
+name = "resend-base"
 version = "0.1.0"
 edition = "2021"
 description = "Catalog service: a BYO-key Resend transactional-email wrapper (templated send + per-owner message log)."
@@ -7,8 +7,8 @@ description = "Catalog service: a BYO-key Resend transactional-email wrapper (te
 [dependencies]
 boogy-sdk = { git = "https://github.com/Boogy-ai/boogy-sdk" }
 # Pure, host-testable logic (template render, Resend body shaping) lives in
-# the sibling email-core crate; its unit tests run via `cargo test --workspace`.
-email-core = { path = "email-core" }
+# the sibling resend-base-core crate; its unit tests run via `cargo test --workspace`.
+resend-base-core = { path = "resend-base-core" }
 wit-bindgen = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -18,7 +18,7 @@ schemars = { workspace = true }
 # cdylib only — wasm component output. `wit_bindgen::generate!` emits
 # wasm-component-only symbols that don't host-link, so adding `rlib` here
 # breaks `cargo test --workspace`. Host-testable pure logic lives in
-# email-core (rlib).
+# resend-base-core (rlib).
 crate-type = ["cdylib"]
 
 [build-dependencies]

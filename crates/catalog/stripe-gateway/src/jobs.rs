@@ -19,7 +19,7 @@
 //! (both writes are pure store ops — no outbound/jobs inside, so they CAN and
 //! SHOULD be atomic).
 //!
-//! ## Transient vs terminal (the email-sender lesson)
+//! ## Transient vs terminal (the resend-base lesson)
 //!
 //! A `#[job]` body cannot tell which attempt is the terminal one (the
 //! `JobRouter::dispatch` surface does not thread `attempts`/`max_attempts`), so

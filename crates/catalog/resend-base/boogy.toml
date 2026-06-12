@@ -1,0 +1,79 @@
+[service]
+id = "resend-base"
+name = "Resend Email Sender"
+version = "0.2.0"
+wasm = "../../../target/wasm32-wasip2/release/resend_base.wasm"
+# Registry metadata — how a developer finds and understands this module. Write
+# it the way they think ("I need to send email"), in plain words. Keywords are a
+# few distinct tags, NOT phrases that restate the name/description (the registry
+# already full-text-searches those).
+description = """
+Send email from your app, powered by Resend — bring your own Resend account \
+and API key. Write a message inline or save reusable layouts with fill-in \
+{{variables}}, send one or a batch, and see a log of everything sent. Sends \
+are queued as durable jobs by default, so a send can be part of a transaction \
+(it goes out only if your transaction commits). App admins get an operator \
+view over everyone's mail and can block a sender. Your API key is stored as a \
+secret the module never reads.\
+"""
+keywords = ["email", "resend"]
+category = "email"
+# Optional display metadata (crates.io-style) surfaced by the registry — a
+# package-page FE renders these. `repository` is the open-source source link.
+repository = "https://github.com/Boogy-ai/boogy-catalog/tree/main/crates/catalog/resend-base"
+license = "MIT OR Apache-2.0"
+authors = ["Boogy"]
+
+[routing]
+path = "/"
+methods = ["*"]
+
+[ingress]
+# Default: any authenticated principal of the app may use the end-user routes
+# (/send, /send/batch, /messages, /templates). The operator surface (/admin/*)
+# is carved out to owner-only below.
+mode = "authenticated"
+
+# Operator routes (/admin/*). NO identity is hardcoded here — the module is
+# provisionable by anyone. `internal` + `allowed_origins = ["*"]` admits any
+# DEPLOYED WORKLOAD (and rejects humans/anonymous); require_operator() then
+# narrows to workloads owned by the SAME owner as this instance, using the
+# runtime self-identity owner. So the operator surface is reachable only by the
+# provisioner's own backend services — without naming any owner in the manifest.
+[[ingress.routes]]
+path = "/admin/*"
+mode = "internal"
+allowed_origins = ["*"]
+
+[capabilities]
+store = true
+auth = true
+clock = true
+entropy = true
+outbound_http = true
+background_jobs = true
+
+# outbound_http is granted, so an [outbound] block with a non-empty
+# allowed_hosts is required. Resend's API is the only third party this
+# service talks to.
+[outbound]
+allowed_hosts = ["api.resend.com"]
+
+# BYO-key: the owner binds their Resend API key out-of-band via the admin
+# secrets endpoint. The wasm only ever sees the name; the host injects the
+# value as an outbound request header.
+[secrets]
+resend_api_key = { usage = ["outbound-header"] }
+
+# The durable send job — the default send path enqueues this; it is also the
+# retry on a transient Resend failure. `max_attempts` MUST match the
+# `MAX_ATTEMPTS` const in src/jobs.rs (the handler flips the message to `failed`
+# on its terminal attempt by comparing ctx.attempts against it).
+[background_jobs.handlers.send_email]
+deadline_ms = 10000
+max_attempts = 5
+backoff_ms = 2000
+
+[limits]
+memory_mb = 32
+timeout_ms = 10000

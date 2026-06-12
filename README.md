@@ -18,8 +18,8 @@ structured.
 
 | Crate | What it is |
 |-------|------------|
-| `crates/catalog/email-sender` | BYO-key transactional email (Resend wrapper): templated send with `{{variables}}`, a per-owner message log, and automatic retry of failed sends. The owner's API key is bound as a secret the service never reads. |
-| `crates/catalog/email-sender/email-core` | Pure, host-testable logic (template rendering, request-body shaping) — unit-tested off-wasm. |
+| `crates/catalog/resend-base` | BYO-key transactional email (Resend wrapper): **async-by-default (transaction-safe) send** + a synchronous option, batch send, `{{variable}}` templates, a per-sender message log, and an operator surface (list-all + sender blocking). The owner's API key is bound as a secret the service never reads. |
+| `crates/catalog/resend-base/resend-base-core` | Pure, host-testable logic (template rendering, request-body shaping) — unit-tested off-wasm. |
 | `crates/catalog/stripe-gateway` | BYO-key payments (Stripe Checkout wrapper): create hosted Checkout Sessions, record orders, and apply signature-verified completion webhooks durably. One deployment can front many of the provisioner's apps, with each app's orders kept separate. |
 | `crates/catalog/stripe-gateway/stripe-core` | Pure, host-testable logic (checkout form-body shaping, `Stripe-Signature` parsing + replay tolerance). |
 
@@ -62,7 +62,7 @@ gitignored.
 
 ```bash
 # build the deployable wasm components
-cargo build -p email-sender -p stripe-gateway --target wasm32-wasip2 --release
+cargo build -p resend-base -p stripe-gateway --target wasm32-wasip2 --release
 
 # run the pure-logic unit tests (the *-core crates)
 cargo test --workspace
@@ -75,7 +75,7 @@ cargo test --workspace
 > **SDK version note:** `stripe-gateway` uses the SDK's host-side HMAC
 > signature-verification helper for Stripe webhooks. If your pinned SDK
 > revision predates that capability, pin `boogy-sdk` / `boogy-wit` to a
-> revision that includes it (or build `email-sender` alone). `email-sender`
+> revision that includes it (or build `resend-base` alone). `resend-base`
 > builds against any recent SDK revision.
 
 Write a manifest (each service ships a `boogy.toml`) and deploy with the `boogy`

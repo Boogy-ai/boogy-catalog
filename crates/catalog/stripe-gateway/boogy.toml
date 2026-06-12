@@ -16,9 +16,12 @@ each app's orders separate.\
 """
 keywords = ["stripe", "payments"]
 category = "payments"
+# Optional display metadata (crates.io-style) surfaced by the registry.
+repository = "https://github.com/Boogy-ai/boogy-catalog/tree/main/crates/catalog/stripe-gateway"
+license = "MIT OR Apache-2.0"
+authors = ["Boogy"]
 
-[service.owner]
-user_id = "alice"
+owner = "alice"
 
 [routing]
 # Claim the whole owner subtree so /webhook, /checkout, /orders all route

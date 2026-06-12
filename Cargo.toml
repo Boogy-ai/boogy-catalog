@@ -6,8 +6,8 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/catalog/email-sender",
-    "crates/catalog/email-sender/email-core",
+    "crates/catalog/resend-base",
+    "crates/catalog/resend-base/resend-base-core",
     "crates/catalog/stripe-gateway",
     "crates/catalog/stripe-gateway/stripe-core",
 ]
