@@ -1,0 +1,5 @@
+/target
+Cargo.lock
+# WIT files are synced into each service crate by its build.rs from the
+# pinned boogy-wit revision — generated, never edited by hand.
+crates/catalog/*/wit/

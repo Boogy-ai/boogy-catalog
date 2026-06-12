@@ -1,0 +1,95 @@
+[service]
+id = "stripe-gateway"
+name = "Stripe Gateway"
+version = "0.1.0"
+wasm = "../../../target/wasm32-wasip2/release/stripe_gateway.wasm"
+# Registry metadata — how a developer finds and understands this module. Write
+# it the way they think ("I need to take payments with Stripe"), in plain words.
+# Keywords are a few distinct tags, NOT phrases that restate the name/description
+# (the registry already full-text-searches those).
+description = """
+Take payments with Stripe Checkout — bring your own Stripe account and key. \
+Send a customer to a hosted Stripe payment page and find out the moment they \
+pay (Stripe's callbacks are verified for you, and your keys are never exposed \
+to the module). One deployment can back all of your apps at once and keeps \
+each app's orders separate.\
+"""
+keywords = ["stripe", "payments"]
+category = "payments"
+
+[service.owner]
+user_id = "alice"
+
+[routing]
+# Claim the whole owner subtree so /webhook, /checkout, /orders all route
+# at the root.
+path = "/"
+methods = ["*"]
+
+[ingress]
+# Per-route ingress. The service-wide default is `mixed`: the MANAGEMENT routes
+# (/checkout, /orders, /orders/{id}) are reachable ONLY by this owner's own apps
+# (internal branch, owner-scoped origins) OR the provisioner directly (allowlist
+# branch). The Stripe `POST /webhook` callback is anonymous (Stripe holds no
+# Boogy identity) so it carves out `public` via a per-route override below; it is
+# authenticated by HMAC signature-verification in-handler, not by ingress.
+#
+# Defense in depth: ingress already rejects strangers from the management routes,
+# AND each management handler additionally derives the attested `client_service`
+# partition (host-set, unspoofable) and scopes every read/write to it, so a
+# client app can only ever see its own orders (cross-client isolation holds
+# regardless of ingress).
+mode = "mixed"
+# internal branch: only THIS owner's own apps (owner-scoped wildcard). A peer
+# call from boogy://alice/services/<anyapp> matches; another owner's app does not.
+allowed_origins = ["boogy://alice/services/*"]
+# allowlist branch: the provisioner (the instance owner) calling directly, e.g.
+# from the dashboard. Agent handles carry the `@` prefix (`AgentMatcher`).
+allowed_agents = ["@alice"]
+
+# Stripe webhook callback: anonymous (Stripe carries no Boogy identity). Most-
+# specific match wins; this exact path overrides the service-wide `mixed` for
+# /webhook only. The handler verifies the Stripe-Signature HMAC host-side
+# (Task 3.5), so "public" here is authenticated by signature, not by ingress.
+[[ingress.routes]]
+path = "/webhook"
+mode = "public"
+
+[capabilities]
+store = true
+auth = true
+clock = true
+entropy = true
+outbound_http = true
+background_jobs = true
+
+# outbound_http is granted, so an [outbound] block with a non-empty
+# allowed_hosts is required. Stripe's API is the only third party this
+# service talks to (DNS-pinned, SSRF-firewalled by the host).
+[outbound]
+allowed_hosts = ["api.stripe.com"]
+
+# BYO-key secrets. The provisioner binds these out-of-band via the admin
+# secrets endpoint; the wasm only ever sees the name.
+[secrets]
+# Injected as the `Authorization` header on outbound calls to api.stripe.com
+# (host injects the bound value verbatim; the wasm never reads it).
+stripe_secret_key = { usage = ["outbound-header"] }
+# Verified HOST-SIDE via the hmac-verify capability: the wasm passes the
+# signed message + expected hex, the host KMS-unwraps the secret, computes the
+# HMAC-SHA256, and constant-time-compares. The wasm never reads the secret and
+# it stays KMS-wrapped at rest. No store config row, no /config endpoint.
+stripe_webhook_secret = { usage = ["hmac-verify"] }
+
+# Durable webhook-apply handler: the /webhook route verifies + dedupes the
+# Stripe event, enqueues this job, and returns 200 fast. The job applies the
+# event (e.g. checkout.session.completed → mark the order paid). Declared here
+# so the manifest + JobRouter wiring are in place; filled in by Task 3.5.
+[background_jobs.handlers.apply_webhook]
+deadline_ms = 10000
+max_attempts = 5
+backoff_ms = 2000
+
+[limits]
+memory_mb = 32
+timeout_ms = 10000

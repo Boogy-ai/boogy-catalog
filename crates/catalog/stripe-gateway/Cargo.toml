@@ -1,0 +1,28 @@
+[package]
+name = "stripe-gateway"
+version = "0.1.0"
+edition = "2021"
+description = "Catalog service: a BYO-key Stripe Checkout wrapper (hosted Checkout Sessions + signature-verified webhooks). Multi-client-service: one instance fronts many of the provisioner's own apps, payments partitioned by client_service."
+
+[dependencies]
+boogy-sdk = { git = "https://github.com/Boogy-ai/boogy-sdk" }
+# Pure, host-testable logic (Stripe checkout form-body shaping, Stripe-Signature
+# header parsing / signed-message construction / replay tolerance) lives in the
+# sibling stripe-core crate; its unit tests run via `cargo test --workspace`.
+stripe-core = { path = "stripe-core" }
+wit-bindgen = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+[lib]
+# cdylib only — wasm component output. `wit_bindgen::generate!` emits
+# wasm-component-only symbols that don't host-link, so adding `rlib` here
+# breaks `cargo test --workspace`. Host-testable pure logic lives in
+# stripe-core (rlib).
+crate-type = ["cdylib"]
+
+[build-dependencies]
+# build.rs syncs the WIT files matching this SDK revision into ./wit so
+# wit_bindgen::generate! (manifest-relative literal path) always resolves.
+boogy-wit = { git = "https://github.com/Boogy-ai/boogy-sdk" }
