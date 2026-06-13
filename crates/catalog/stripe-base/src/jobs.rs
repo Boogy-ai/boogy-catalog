@@ -1,4 +1,4 @@
-//! Background-job handler bodies for stripe-gateway.
+//! Background-job handler bodies for stripe-base.
 //!
 //! The only job is `apply_webhook`: the durable application of a verified,
 //! deduped Stripe event. The `POST /webhook` handler verifies the signature
@@ -29,9 +29,10 @@
 //! `Err(..)` and LEAVES the event in `received`, so the platform's backoff
 //! retries it honestly.
 
-use boogy_sdk::job;
 use boogy_sdk::model::Timestamp;
 use boogy_sdk::store::Val;
+use boogy_sdk::{job, JobContext, JobError};
+use stripe_base_core::CheckoutInput;
 
 use crate::bindings::boogy::platform::runtime;
 use crate::models::{Order, WebhookEvent};
@@ -43,6 +44,78 @@ use crate::{db_find_by, db_get, db_update, tx, Deserialize};
 #[derive(Deserialize)]
 pub struct ApplyPayload {
     pub webhook_event_id: u64,
+}
+
+/// Mirrors `boogy.toml` `[background_jobs.handlers.create_checkout] max_attempts`.
+/// The job compares `ctx.attempts` against this to detect the TERMINAL attempt
+/// and flip the order to `failed` (vs an honest transient `Retry`).
+const CHECKOUT_MAX_ATTEMPTS: u32 = 5;
+
+/// Payload the async `create_checkout` path enqueues. Carries the order row id
+/// PLUS the checkout inputs not persisted on the order
+/// (`product_name`/`success_url`/`cancel_url`), so the job is self-describing.
+#[derive(Deserialize)]
+pub struct CreateCheckoutPayload {
+    pub order_id: u64,
+    pub amount: i64,
+    pub currency: String,
+    pub product_name: String,
+    pub success_url: String,
+    pub cancel_url: String,
+}
+
+/// Durable creation of one Stripe Checkout Session (the async default for
+/// `POST /checkout`). Reloads the order, and if still `queued` calls Stripe
+/// (`POST /v1/checkout/sessions`) with a per-order `Idempotency-Key`, then:
+/// - success → flip the order to `pending` with the session id + checkout URL
+///   (idempotent: a no-op if the order already left `queued`);
+/// - failure → on the TERMINAL attempt (`ctx.attempts >= CHECKOUT_MAX_ATTEMPTS`)
+///   flip the order to `failed` (so the owner sees a definitive outcome, not a
+///   perpetually-`queued` order) and return [`JobError::Terminal`]; otherwise
+///   return [`JobError::Retry`] and let the platform back off and re-run.
+///
+/// Idempotency: an order already past `queued` (`pending`/`paid`/`failed`) is a
+/// no-op success — covers an at-least-once re-delivery of this job. The Stripe
+/// `Idempotency-Key` (keyed on the order) makes the external call itself safe to
+/// retry, so even a re-run after a committed-Stripe / failed-store-update window
+/// returns the same session rather than charging twice.
+#[job("create_checkout")]
+pub fn create_checkout(ctx: JobContext, payload: CreateCheckoutPayload) -> Result<(), JobError> {
+    let order_id = payload.order_id;
+
+    let order = db_get::<Order>(order_id)
+        .map_err(|e| JobError::Retry(format!("reload order {order_id}: {e:?}")))?
+        .ok_or_else(|| JobError::Terminal(format!("order {order_id} not found")))?;
+
+    // Already created / paid / failed — nothing to do (idempotent re-delivery).
+    if order.status != "queued" {
+        return Ok(());
+    }
+
+    let input = CheckoutInput {
+        amount: payload.amount,
+        currency: payload.currency.clone(),
+        product_name: payload.product_name.clone(),
+        success_url: payload.success_url.clone(),
+        cancel_url: payload.cancel_url.clone(),
+    };
+
+    match crate::create_stripe_session(&input, Some(&crate::order_idempotency_key(order_id))) {
+        Ok((session_id, checkout_url)) => crate::set_order_pending(order_id, &session_id, &checkout_url)
+            .map_err(JobError::Retry),
+        Err(e) => {
+            let msg = format!("{e:?}");
+            if ctx.attempts >= CHECKOUT_MAX_ATTEMPTS {
+                // Terminal: best-effort flip to `failed` (a transient store error
+                // here still surfaces as Retry, but the platform is out of attempts
+                // anyway — the next manual replay / reconciliation resolves it).
+                crate::set_order_failed(order_id, &msg).map_err(JobError::Retry)?;
+                Err(JobError::Terminal(msg))
+            } else {
+                Err(JobError::Retry(msg))
+            }
+        }
+    }
 }
 
 /// Durable application of one verified Stripe event.
@@ -116,7 +189,7 @@ pub fn apply_webhook(payload: ApplyPayload) -> Result<(), String> {
     // Multi-write, both pure store ops → ONE atomic tx (no outbound/jobs inside).
     // Re-read inside the tx so a concurrent writer can't be clobbered, and the
     // partition is recovered FROM THE ORDER (not the webhook).
-    tx::<_, _, String>(|| {
+    let result = tx::<_, _, String>(|| {
         let mut order = db_get::<Order>(order_id)
             .map_err(|e| format!("reload order {order_id} in tx: {e:?}"))?
             .ok_or_else(|| format!("order {order_id} vanished mid-tx"))?;
@@ -133,7 +206,17 @@ pub fn apply_webhook(payload: ApplyPayload) -> Result<(), String> {
         db_update(event_row_id, &event)
             .map_err(|e| format!("update event {event_row_id}: {e:?}"))?;
         Ok(())
-    })
+    });
+
+    // Notify the buyer's room AFTER the commit (never inside the tx, where
+    // outbound side-effects are disallowed). Best-effort: a dropped publish is
+    // reconciled by the client on reconnect / poll.
+    if result.is_ok() {
+        if let Ok(Some(o)) = db_get::<Order>(order_id) {
+            crate::publish_order_status(&o);
+        }
+    }
+    result
 }
 
 /// Stamp the event with a TERMINAL `process_status` (+ `processed_at`, +

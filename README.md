@@ -20,8 +20,8 @@ structured.
 |-------|------------|
 | `crates/catalog/resend-base` | BYO-key transactional email (Resend wrapper): **async-by-default (transaction-safe) send** + a synchronous option, batch send, `{{variable}}` templates, a per-sender message log, and an operator surface (list-all + sender blocking). The owner's API key is bound as a secret the service never reads. |
 | `crates/catalog/resend-base/resend-base-core` | Pure, host-testable logic (template rendering, request-body shaping) — unit-tested off-wasm. |
-| `crates/catalog/stripe-gateway` | BYO-key payments (Stripe Checkout wrapper): create hosted Checkout Sessions, record orders, and apply signature-verified completion webhooks durably. One deployment can front many of the provisioner's apps, with each app's orders kept separate. |
-| `crates/catalog/stripe-gateway/stripe-core` | Pure, host-testable logic (checkout form-body shaping, `Stripe-Signature` parsing + replay tolerance). |
+| `crates/catalog/stripe-base` | BYO-key payments (Stripe Checkout wrapper): create hosted Checkout Sessions, record orders, and apply signature-verified completion webhooks durably. One deployment can front many of the provisioner's apps, with each app's orders kept separate. |
+| `crates/catalog/stripe-base/stripe-base-core` | Pure, host-testable logic (checkout form-body shaping, `Stripe-Signature` parsing + replay tolerance). |
 
 ## Patterns to learn from
 
@@ -36,7 +36,7 @@ Each service demonstrates the conventions the SDK's `AGENTS.md` prescribes:
   or verified host-side (HMAC), so the wasm never reads the secret value.
 - **Durable background jobs** for work that must survive a crash (retry on
   transient failure; apply a verified webhook after returning `200` fast).
-- **Per-route ingress** (`stripe-gateway`): owner-only management routes alongside
+- **Per-route ingress** (`stripe-base`): owner-only management routes alongside
   an anonymous, signature-authenticated webhook route.
 - **Independent-writes vs. transactions**: where an external call or a job-enqueue
   sits between two writes, they cannot be one transaction — the services show the
@@ -62,7 +62,7 @@ gitignored.
 
 ```bash
 # build the deployable wasm components
-cargo build -p resend-base -p stripe-gateway --target wasm32-wasip2 --release
+cargo build -p resend-base -p stripe-base --target wasm32-wasip2 --release
 
 # run the pure-logic unit tests (the *-core crates)
 cargo test --workspace
@@ -72,7 +72,7 @@ cargo test --workspace
 > resolve `Boogy-ai/boogy-sdk`. The `*-core` crates are plain `rlib`s and test
 > in isolation.
 >
-> **SDK version note:** `stripe-gateway` uses the SDK's host-side HMAC
+> **SDK version note:** `stripe-base` uses the SDK's host-side HMAC
 > signature-verification helper for Stripe webhooks. If your pinned SDK
 > revision predates that capability, pin `boogy-sdk` / `boogy-wit` to a
 > revision that includes it (or build `resend-base` alone). `resend-base`

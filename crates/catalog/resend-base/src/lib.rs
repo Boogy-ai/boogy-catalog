@@ -21,11 +21,11 @@
 //! - **End users** (any authenticated principal of the app) use `/send`,
 //!   `/send/batch`, `/messages`, `/templates` — every read is principal-scoped
 //!   (`auth::current_principal` + an owner-column filter, 404-masking).
-//! - **The operator** (the provisioner's OWN backend services) uses `/admin/*`
-//!   to list/filter ALL principals' messages and to block/unblock a sender.
-//!   `/admin/*` admits only deployed workloads at the ingress layer (`internal`)
-//!   and [`require_operator`] narrows them to the SAME owner as this instance —
-//!   learned at runtime from the self-identity capability, so NO identity is
+//! - **The operator** (the service owner — the provisioner) uses `/admin/*` to
+//!   list/filter ALL principals' messages and to block/unblock a sender. The
+//!   owner reaches it DIRECTLY (their agent token — they can curl it) or via
+//!   their own backend (a workload). [`require_operator`] gates it with the
+//!   host-attested `caller_is_service_owner` capability, so NO identity is
 //!   hardcoded in the manifest (the module is provisionable by anyone).
 //!
 //! Tables are `#[derive(Model)]` structs (see [`models`]); CRUD goes through
@@ -42,7 +42,8 @@ boogy_sdk::wit_glue!(bindings, ResendBase, with_jobs);
 
 use boogy_sdk::jobs::JobSpec;
 use boogy_sdk::model::{Id, Model, Timestamp};
-use boogy_sdk::store::Val;
+use boogy_sdk::pagination::{decode, CursorPage};
+use boogy_sdk::store::{SortDir, Val};
 use boogy_sdk::{Api, JobRouter};
 
 use bindings::boogy::platform::outbound_http;
@@ -108,7 +109,7 @@ impl Api for ResendBase {
                 .description("Delete one of the principal's templates by id (404-masked).")
                 .delete("/templates/{id}", delete_template))
 
-            // ── Operator surface (/admin/*; owner-only via ingress + require_operator) ─
+            // ── Operator surface (/admin/*; owner-only via require_operator → caller_is_service_owner) ─
             .summary("List all messages (operator)")
             .description("Operator-only: list/filter messages across ALL principals. \
                           Filters: ?principal=, ?status=, ?to=, ?since= (epoch-ms), \
@@ -142,28 +143,32 @@ impl Api for ResendBase {
 
 /// Operator check for `/admin/*`. This is the PRIMARY gate, and it hardcodes
 /// NO identity — the module is provisionable by anyone, so the owner is learned
-/// at RUNTIME from the ungated self-identity capability.
+/// at RUNTIME — NO identity is hardcoded (the module is provisionable by anyone).
 ///
-/// The instance's owner is `self_identity().owner` (host-pinned to whoever
-/// provisioned this instance). A caller is the operator iff their ATTESTED
-/// workload (the principal, or the OBO `actor`) is owned by that same owner —
-/// i.e. one of the provisioner's OWN backend services. The `/admin/*` ingress
-/// override already admits only deployed workloads (`internal` mode rejects
-/// humans/anonymous); this narrows them to same-owner workloads. A cross-owner
-/// workload (which ingress's `["*"]` lets reach the handler) gets 403 here.
+/// Admits, in order:
+/// 1. `caller_is_service_owner()` — the host attests that the caller is THIS
+///    service's owner: the provisioner's own **agent token** (their handle,
+///    resolved host-side against the agents registry) OR one of their own
+///    **workloads** (direct). This is what lets the human owner curl `/admin`.
+/// 2. An **OBO** hop where the owner's own backend acts on behalf of a user —
+///    `caller_is_service_owner` reflects the delegated end-user `principal`, so
+///    the owner is recognized via the ATTESTED `actor` workload here.
 ///
-/// Direct human/dashboard admin access therefore goes through the provisioner's
-/// own backend (which calls these routes as a workload) — not a raw agent token,
-/// which carries no owner handle a wasm component could verify.
+/// Anyone else → `403`. `/admin/*` ingress is just `authenticated` (rejects
+/// anonymous); this handler is the real gate.
 fn require_operator() -> Result<(), ApiError> {
-    let our_owner = self_identity().owner;
-    let identity = bindings::boogy::platform::auth::current_identity();
-    let principal = identity.as_ref().map(|i| i.principal.as_str()).unwrap_or("");
-    let actor = identity.as_ref().and_then(|i| i.actor.as_deref());
-    match workload_owner(principal).or_else(|| actor.and_then(workload_owner)) {
-        Some(o) if o == our_owner => Ok(()),
-        _ => Err(ApiError::forbidden("operator access required")),
+    if caller_is_service_owner() {
+        return Ok(());
     }
+    let identity = bindings::boogy::platform::auth::current_identity();
+    let actor_owner = identity
+        .as_ref()
+        .and_then(|i| i.actor.as_deref())
+        .and_then(workload_owner);
+    if actor_owner == Some(self_identity().owner) {
+        return Ok(());
+    }
+    Err(ApiError::forbidden("operator access required"))
 }
 
 /// True if `principal` is on the block list (a single keyed lookup).
@@ -534,10 +539,17 @@ struct MessageOut {
     sent_at: Option<i64>,
 }
 
-#[derive(Serialize, schemars::JsonSchema)]
-struct MessageList {
-    items: Vec<MessageOut>,
-    count: usize,
+/// Shared keyset-pagination params for every list endpoint: `?limit=` (default
+/// 50, clamped 1..=200) + an opaque `?cursor=` decoded back to a [`Cursor`]
+/// (`None` on the first page or a malformed cursor — fail-soft to page one).
+fn page_params(req: &mut Req<'_>) -> (usize, Option<boogy_sdk::pagination::Cursor>) {
+    let limit = req
+        .query("limit")
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(50)
+        .clamp(1, 200);
+    let cursor = req.query("cursor").and_then(decode);
+    (limit, cursor)
 }
 
 fn message_out(r: &Row) -> MessageOut {
@@ -556,16 +568,19 @@ fn message_out(r: &Row) -> MessageOut {
     }
 }
 
-/// List the authenticated principal's messages, newest first.
-fn list_messages(_req: &mut Req<'_>) -> Result<Json<MessageList>, ApiError> {
+/// List the authenticated principal's messages, keyset-paginated newest-first
+/// by `created_at` (backed by `list_by(filter = "owner_principal", …)`).
+/// `?limit=`/`?cursor=` page the walk.
+fn list_messages(req: &mut Req<'_>) -> Result<Json<CursorPage<MessageOut>>, ApiError> {
     let principal = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
-    let rows = Query::on(Message::TABLE)
+    let (limit, cursor) = page_params(req);
+    let page = Query::on(Message::TABLE)
         .where_eq(DEFAULT_OWNER_COL, principal.as_str())
-        .order_by_desc("_id")
-        .fetch_all()?;
-    let items: Vec<MessageOut> = rows.iter().map(message_out).collect();
-    let count = items.len();
-    Ok(Json(MessageList { items, count }))
+        .keyset_by(Message::CREATED_AT, SortDir::Desc)
+        .limit(limit)
+        .cursor(cursor)
+        .fetch_page(|r| message_out(r))?;
+    Ok(Json(page))
 }
 
 /// Fetch one of the principal's messages by id (404-masked).
@@ -596,12 +611,6 @@ struct TemplateOut {
     text: Option<String>,
     created_at: i64,
     updated_at: i64,
-}
-
-#[derive(Serialize, schemars::JsonSchema)]
-struct TemplateList {
-    items: Vec<TemplateOut>,
-    count: usize,
 }
 
 fn template_out(r: &Row) -> TemplateOut {
@@ -642,15 +651,18 @@ fn create_template(Json(input): Json<CreateTemplate>) -> Result<Created<Template
     }))
 }
 
-fn list_templates(_req: &mut Req<'_>) -> Result<Json<TemplateList>, ApiError> {
+/// List the principal's templates, keyset-paginated newest-first by `created_at`
+/// (backed by `list_by(filter = "owner_principal", …)`).
+fn list_templates(req: &mut Req<'_>) -> Result<Json<CursorPage<TemplateOut>>, ApiError> {
     let principal = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
-    let rows = Query::on(Template::TABLE)
+    let (limit, cursor) = page_params(req);
+    let page = Query::on(Template::TABLE)
         .where_eq(DEFAULT_OWNER_COL, principal.as_str())
-        .order_by_desc("_id")
-        .fetch_all()?;
-    let items: Vec<TemplateOut> = rows.iter().map(template_out).collect();
-    let count = items.len();
-    Ok(Json(TemplateList { items, count }))
+        .keyset_by(Template::CREATED_AT, SortDir::Desc)
+        .limit(limit)
+        .cursor(cursor)
+        .fetch_page(|r| template_out(r))?;
+    Ok(Json(page))
 }
 
 fn get_template(req: &mut Req<'_>) -> Result<Json<TemplateOut>, ApiError> {
@@ -688,12 +700,6 @@ struct AdminMessageOut {
     sent_at: Option<i64>,
 }
 
-#[derive(Serialize, schemars::JsonSchema)]
-struct AdminMessageList {
-    items: Vec<AdminMessageOut>,
-    count: usize,
-}
-
 fn admin_message_out(r: &Row) -> AdminMessageOut {
     let m = Message::from_row(r);
     AdminMessageOut {
@@ -713,38 +719,35 @@ fn admin_message_out(r: &Row) -> AdminMessageOut {
     }
 }
 
-/// Operator-only: list/filter messages across ALL principals.
-fn admin_list_messages(req: &mut Req<'_>) -> Result<Json<AdminMessageList>, ApiError> {
+/// Operator-only: keyset-paginated message listing across ALL principals,
+/// newest-first by `created_at`. Filters (all optional, combine with AND):
+/// `principal` (owner_principal), `status`, `to` (to_addr), `since` (created_at
+/// >= epoch-ms). `principal`/`status` ride their `list_by` composites; `to` is a
+/// residual filter on the keyset walk (correct, just not separately indexed).
+/// `?limit=`/`?cursor=` page the walk.
+fn admin_list_messages(req: &mut Req<'_>) -> Result<Json<CursorPage<AdminMessageOut>>, ApiError> {
     require_operator()?;
-
-    let limit = req
-        .query("limit")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(100)
-        .clamp(1, 1000);
+    let (limit, cursor) = page_params(req);
 
     let mut q = Query::on(Message::TABLE);
     if let Some(p) = req.query("principal").filter(|s| !s.is_empty()) {
         q = q.where_eq(Message::OWNER_PRINCIPAL, p);
-    } else if let Some(s) = req.query("status").filter(|s| !s.is_empty()) {
-        q = q.where_eq(Message::STATUS, s);
-    } else {
-        q = q.allow_full_scan("operator lists across all principals");
     }
-    let rows = q.order_by_desc("_id").limit(limit).fetch_all()?;
-
-    // `to` / `since` are not indexed — post-filter the (bounded) page in Rust.
-    let to_filter = req.query("to").map(|s| s.to_string());
-    let since_filter = req.query("since").and_then(|s| s.parse::<i64>().ok());
-
-    let items: Vec<AdminMessageOut> = rows
-        .iter()
-        .map(admin_message_out)
-        .filter(|m| to_filter.as_ref().is_none_or(|t| &m.to_addr == t))
-        .filter(|m| since_filter.is_none_or(|s| m.created_at >= s))
-        .collect();
-    let count = items.len();
-    Ok(Json(AdminMessageList { items, count }))
+    if let Some(s) = req.query("status").filter(|s| !s.is_empty()) {
+        q = q.where_eq(Message::STATUS, s);
+    }
+    if let Some(t) = req.query("to").filter(|s| !s.is_empty()) {
+        q = q.where_eq(Message::TO_ADDR, t);
+    }
+    if let Some(since) = req.query("since").and_then(|s| s.parse::<i64>().ok()) {
+        q = q.where_gte(Message::CREATED_AT, since);
+    }
+    let page = q
+        .keyset_by(Message::CREATED_AT, SortDir::Desc)
+        .limit(limit)
+        .cursor(cursor)
+        .fetch_page(|r| admin_message_out(r))?;
+    Ok(Json(page))
 }
 
 /// Operator-only: fetch any message by id (including its rendered body).
@@ -783,12 +786,6 @@ struct BlockOut {
     created_at: i64,
 }
 
-#[derive(Serialize, schemars::JsonSchema)]
-struct BlockList {
-    items: Vec<BlockOut>,
-    count: usize,
-}
-
 #[derive(Deserialize, schemars::JsonSchema)]
 struct CreateBlock {
     principal: String,
@@ -806,16 +803,17 @@ fn block_out(r: &Row) -> BlockOut {
     }
 }
 
-/// Operator-only: list blocked senders, newest first.
-fn admin_list_blocks(_req: &mut Req<'_>) -> Result<Json<BlockList>, ApiError> {
+/// Operator-only: keyset-paginated blocked-senders list, newest-first by
+/// `created_at` (backed by `ranked_by(highest = "created_at")`).
+fn admin_list_blocks(req: &mut Req<'_>) -> Result<Json<CursorPage<BlockOut>>, ApiError> {
     require_operator()?;
-    let rows = Query::on(BlockedSender::TABLE)
-        .allow_full_scan("operator lists all blocked senders")
-        .order_by_desc("_id")
-        .fetch_all()?;
-    let items: Vec<BlockOut> = rows.iter().map(block_out).collect();
-    let count = items.len();
-    Ok(Json(BlockList { items, count }))
+    let (limit, cursor) = page_params(req);
+    let page = Query::on(BlockedSender::TABLE)
+        .keyset_by(BlockedSender::CREATED_AT, SortDir::Desc)
+        .limit(limit)
+        .cursor(cursor)
+        .fetch_page(|r| block_out(r))?;
+    Ok(Json(page))
 }
 
 /// Operator-only: block a principal from sending (idempotent — re-blocking

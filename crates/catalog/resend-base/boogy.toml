@@ -29,21 +29,14 @@ path = "/"
 methods = ["*"]
 
 [ingress]
-# Default: any authenticated principal of the app may use the end-user routes
-# (/send, /send/batch, /messages, /templates). The operator surface (/admin/*)
-# is carved out to owner-only below.
+# All routes require an authenticated principal; nothing anonymous. The operator
+# surface (/admin/*) needs no per-route ingress override and NO hardcoded
+# identity (the module is provisionable by anyone): the handler gates it with
+# require_operator(), which uses the host-attested `caller_is_service_owner`
+# capability to admit the service owner — their own agent token (resolved
+# host-side) OR one of their own workloads. So the human owner can curl /admin
+# directly, and the owner's backend can call it over peer.
 mode = "authenticated"
-
-# Operator routes (/admin/*). NO identity is hardcoded here — the module is
-# provisionable by anyone. `internal` + `allowed_origins = ["*"]` admits any
-# DEPLOYED WORKLOAD (and rejects humans/anonymous); require_operator() then
-# narrows to workloads owned by the SAME owner as this instance, using the
-# runtime self-identity owner. So the operator surface is reachable only by the
-# provisioner's own backend services — without naming any owner in the manifest.
-[[ingress.routes]]
-path = "/admin/*"
-mode = "internal"
-allowed_origins = ["*"]
 
 [capabilities]
 store = true

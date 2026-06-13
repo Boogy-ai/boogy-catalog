@@ -1,8 +1,8 @@
 [service]
-id = "stripe-gateway"
+id = "stripe-base"
 name = "Stripe Gateway"
 version = "0.1.0"
-wasm = "../../../target/wasm32-wasip2/release/stripe_gateway.wasm"
+wasm = "../../../target/wasm32-wasip2/release/stripe_base.wasm"
 # Registry metadata — how a developer finds and understands this module. Write
 # it the way they think ("I need to take payments with Stripe"), in plain words.
 # Keywords are a few distinct tags, NOT phrases that restate the name/description
@@ -17,7 +17,7 @@ each app's orders separate.\
 keywords = ["stripe", "payments"]
 category = "payments"
 # Optional display metadata (crates.io-style) surfaced by the registry.
-repository = "https://github.com/Boogy-ai/boogy-catalog/tree/main/crates/catalog/stripe-gateway"
+repository = "https://github.com/Boogy-ai/boogy-catalog/tree/main/crates/catalog/stripe-base"
 license = "MIT OR Apache-2.0"
 authors = ["Boogy"]
 
@@ -30,30 +30,19 @@ path = "/"
 methods = ["*"]
 
 [ingress]
-# Per-route ingress. The service-wide default is `mixed`: the MANAGEMENT routes
-# (/checkout, /orders, /orders/{id}) are reachable ONLY by this owner's own apps
-# (internal branch, owner-scoped origins) OR the provisioner directly (allowlist
-# branch). The Stripe `POST /webhook` callback is anonymous (Stripe holds no
-# Boogy identity) so it carves out `public` via a per-route override below; it is
-# authenticated by HMAC signature-verification in-handler, not by ingress.
-#
-# Defense in depth: ingress already rejects strangers from the management routes,
-# AND each management handler additionally derives the attested `client_service`
-# partition (host-set, unspoofable) and scopes every read/write to it, so a
-# client app can only ever see its own orders (cross-client isolation holds
-# regardless of ingress).
-mode = "mixed"
-# internal branch: only THIS owner's own apps (owner-scoped wildcard). A peer
-# call from boogy://alice/services/<anyapp> matches; another owner's app does not.
-allowed_origins = ["boogy://alice/services/*"]
-# allowlist branch: the provisioner (the instance owner) calling directly, e.g.
-# from the dashboard. Agent handles carry the `@` prefix (`AgentMatcher`).
-allowed_agents = ["@alice"]
+# Management routes require an authenticated principal; NO identity is hardcoded
+# (the module is provisionable by anyone). The handlers' audience() does the
+# authorization, host-attested: the SERVICE OWNER's agent (caller_is_service_owner)
+# → Owner (sees all apps); a workload OWNED BY the service owner → that client
+# app's partition; anyone else (a different owner's workload, a non-owner agent)
+# → 403. So cross-owner isolation holds in-handler, without an owner-scoped
+# ingress allowlist that would hardcode the wrong owner for every other provisioner.
+mode = "authenticated"
 
 # Stripe webhook callback: anonymous (Stripe carries no Boogy identity). Most-
-# specific match wins; this exact path overrides the service-wide `mixed` for
-# /webhook only. The handler verifies the Stripe-Signature HMAC host-side
-# (Task 3.5), so "public" here is authenticated by signature, not by ingress.
+# specific match wins; this exact path overrides the service-wide default for
+# /webhook only. The handler verifies the Stripe-Signature HMAC host-side, so
+# "public" here is authenticated by signature, not by ingress.
 [[ingress.routes]]
 path = "/webhook"
 mode = "public"
@@ -65,6 +54,16 @@ clock = true
 entropy = true
 outbound_http = true
 background_jobs = true
+websockets = true
+
+# Per-buyer order updates: each committed order transition pushes an
+# `order.status` envelope to the buyer's own room. `class = "principal"` scopes
+# delivery to the addressed customer_ref; `replay` lets a reconnecting client
+# catch the last few transitions it missed.
+[[websockets.channels]]
+name = "orders"
+class = "principal"
+replay = 8
 
 # outbound_http is granted, so an [outbound] block with a non-empty
 # allowed_hosts is required. Stripe's API is the only third party this
@@ -86,10 +85,19 @@ stripe_webhook_secret = { usage = ["hmac-verify"] }
 
 # Durable webhook-apply handler: the /webhook route verifies + dedupes the
 # Stripe event, enqueues this job, and returns 200 fast. The job applies the
-# event (e.g. checkout.session.completed → mark the order paid). Declared here
-# so the manifest + JobRouter wiring are in place; filled in by Task 3.5.
+# event (e.g. checkout.session.completed → mark the order paid).
 [background_jobs.handlers.apply_webhook]
 deadline_ms = 10000
+max_attempts = 5
+backoff_ms = 2000
+
+# Durable checkout-session creation (the async DEFAULT for POST /checkout): the
+# handler inserts a `queued` order and enqueues this job, which calls Stripe with
+# a per-order Idempotency-Key and flips the order to `pending` (with the checkout
+# URL) on success, or `failed` after exhausting attempts. deadline > the 8s Stripe
+# call timeout; max_attempts mirrors CHECKOUT_MAX_ATTEMPTS in jobs.rs.
+[background_jobs.handlers.create_checkout]
+deadline_ms = 12000
 max_attempts = 5
 backoff_ms = 2000
 

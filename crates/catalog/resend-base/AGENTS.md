@@ -27,11 +27,13 @@ All calls arrive over `peer::fetch` from your own backend. Three shapes:
 |---|---|---|
 | on behalf of a user (OBO) | `principal = agent_<user>`, `actor = boogy://<you>/services/<svc>` | user-triggered mail (welcome, receipt) — the message is owned by that user |
 | as your service | `principal = boogy://<you>/services/<svc>` | system mail |
-| as the operator | a workload owned by you (any `boogy://<you>/services/*`) | the `/admin/*` surface |
+| as the operator | YOU directly (your own agent token) OR a workload owned by you | the `/admin/*` surface |
 
 End-user routes are scoped to `principal` (each sender sees only their own
-mail). The operator surface is reachable only by **your own backend workloads**
-(checked at runtime via self-identity — no identity is configured anywhere).
+mail). The operator surface admits **the service owner**: you can curl `/admin/*`
+directly with your own token (the host attests `caller_is_service_owner` — it
+resolves your agent's handle host-side), or your backend can call it as a
+workload. No identity is configured anywhere.
 
 ## Sending
 
@@ -70,7 +72,7 @@ all scoped to the calling principal.
 
 `GET /messages` / `GET /messages/{id}` — the calling principal's messages only.
 
-## Operator surface (`/admin/*`, your backend only)
+## Operator surface (`/admin/*`, the service owner)
 
 | Call | Does |
 |---|---|

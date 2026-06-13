@@ -1,4 +1,4 @@
-//! Pure, host-testable logic for the stripe-gateway catalog service.
+//! Pure, host-testable logic for the stripe-base catalog service.
 
 pub struct CheckoutInput {
     pub amount: i64,        // minor units
@@ -72,14 +72,19 @@ pub fn client_service_from_workload(principal: &str, actor: Option<&str>) -> Opt
     parse_workload_service(principal).or_else(|| actor.and_then(parse_workload_service))
 }
 
-/// Parse the `<name>` out of a workload URI `boogy://<owner>/services/<name>[@ver]`.
-/// Returns `None` for agent principals (`agent_…`), malformed URIs, non-`services`
-/// kinds, or URIs with extra path segments. An optional `@version` is stripped.
-fn parse_workload_service(principal: &str) -> Option<String> {
-    let rest = principal.strip_prefix("boogy://")?; // "<owner>/services/<name>[@ver]"
+/// Parse `(owner, service_name)` out of a workload URI
+/// `boogy://<owner>/services/<name>[@ver]`. Returns `None` for agent principals
+/// (`agent_…`), malformed URIs, non-`services` kinds, or URIs with extra path
+/// segments. An optional `@version` is stripped.
+///
+/// The `owner` segment is what the in-handler audience check compares against
+/// `self_identity().owner` — to confirm an attested caller is one of the SERVICE
+/// OWNER's own apps (cross-owner isolation: a different owner's workload is not a
+/// client app of this deployment).
+pub fn parse_workload_owner_service(uri: &str) -> Option<(String, String)> {
+    let rest = uri.strip_prefix("boogy://")?; // "<owner>/services/<name>[@ver]"
     let mut parts = rest.split('/');
-    // Require a non-empty owner segment but we only return the service name.
-    parts.next().filter(|s| !s.is_empty())?;
+    let owner = parts.next().filter(|s| !s.is_empty())?;
     if parts.next()? != "services" {
         return None;
     }
@@ -88,7 +93,22 @@ fn parse_workload_service(principal: &str) -> Option<String> {
         return None; // extra path segments → not a bare workload URI
     }
     let name = name_ver.split('@').next().filter(|s| !s.is_empty())?;
-    Some(name.to_string())
+    Some((owner.to_string(), name.to_string()))
+}
+
+/// `(owner, service)` of the ATTESTED caller workload — the `principal` (direct
+/// peer call) or the OBO `actor` (delegated hop), tried in that order. `None` for
+/// an agent/anonymous caller. The audience check uses `owner` to enforce that the
+/// caller is one of THIS service owner's apps, and `service` as the partition key.
+pub fn workload_owner_service(principal: &str, actor: Option<&str>) -> Option<(String, String)> {
+    parse_workload_owner_service(principal)
+        .or_else(|| actor.and_then(parse_workload_owner_service))
+}
+
+/// Parse the `<name>` out of a workload URI (DRY wrapper over
+/// [`parse_workload_owner_service`]).
+fn parse_workload_service(principal: &str) -> Option<String> {
+    parse_workload_owner_service(principal).map(|(_, name)| name)
 }
 
 #[cfg(test)]
@@ -154,6 +174,28 @@ mod client_service_tests {
             client_service_from_workload("garbage", Some("boogy://alice/services/x")),
             Some("x".to_string())
         );
+    }
+
+    #[test]
+    fn workload_owner_service_extracts_both() {
+        assert_eq!(
+            parse_workload_owner_service("boogy://alice/services/storefront"),
+            Some(("alice".to_string(), "storefront".to_string()))
+        );
+        assert_eq!(
+            parse_workload_owner_service("boogy://alice/services/storefront@3"),
+            Some(("alice".to_string(), "storefront".to_string()))
+        );
+        // OBO: principal is an agent, the actor carries the workload.
+        assert_eq!(
+            workload_owner_service("agent_018f", Some("boogy://bob/services/api")),
+            Some(("bob".to_string(), "api".to_string()))
+        );
+        // Agents / malformed → None (so the audience falls through to the
+        // owner-agent or denied branch — never silently a client app).
+        assert_eq!(parse_workload_owner_service("agent_018f"), None);
+        assert_eq!(parse_workload_owner_service("boogy://alice/modules/x"), None);
+        assert_eq!(workload_owner_service("agent_018f", None), None);
     }
 }
 

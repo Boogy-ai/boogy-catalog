@@ -1,4 +1,4 @@
-# stripe-gateway
+# stripe-base
 
 A **bring-your-own-key** payments service for [Boogy](https://boogy.ai), built as
 a wrapper around [Stripe Checkout](https://stripe.com/payments/checkout).
@@ -6,18 +6,21 @@ a wrapper around [Stripe Checkout](https://stripe.com/payments/checkout).
 You bind your own Stripe secret key and webhook signing secret (as secrets the
 service never reads), and the service gives you:
 
-- a `POST /checkout` endpoint that creates a **hosted Stripe Checkout Session**
-  and records a pending order,
+- a `POST /checkout` endpoint that records a durable **`queued`** order and
+  creates the **hosted Stripe Checkout Session** via a transaction-safe durable
+  job (so a checkout can be enqueued *inside* a caller's transaction) — or inline
+  with `synchronous: true`,
 - **signature-verified completion webhooks** (`POST /webhook`) applied durably —
   the order flips to `paid` the moment Stripe confirms payment,
 - **per-app order tracking** (`GET /orders`) — one deployment can front *many* of
   your own apps, with each app's orders kept strictly separate.
 
 It is also a canonical example of three advanced Boogy patterns: **host-side HMAC
-verification** (the webhook secret never leaves the host), **per-route ingress**
-(owner-only management routes next to an anonymous webhook), and
-**attested multi-tenant partitioning** (one instance, many client apps, isolated
-by host-set workload identity).
+verification** (the webhook secret never leaves the host), **host-attested
+in-handler authorization** (an `authenticated` ingress with NO hardcoded owner;
+the handler's `audience()` does the owner-scoping), and **attested multi-tenant
+partitioning** (one deployment, many client apps, isolated by host-set workload
+identity).
 
 ---
 
@@ -44,14 +47,14 @@ by host-set workload identity).
 
 This is the one concept to understand before everything else.
 
-**ONE provisioned instance fronts MANY of your apps.** You deploy `stripe-gateway`
+**ONE provisioned deployment fronts MANY of your apps.** You deploy `stripe-base`
 once, bind your Stripe keys once, and then any number of your *own* apps
 (`storefront`, `mobile-api`, `admin`, …) can create checkouts through it. Orders
 are partitioned on two axes:
 
 | Axis | Column | Meaning |
 |------|--------|---------|
-| **Instance owner** | `owner_principal` | You — the provisioner who deployed this instance. |
+| **Service owner** | `owner_principal` | You — the provisioner who deployed this service. |
 | **Which of your apps** | `client_service` | The specific app a payment belongs to. |
 
 The crucial property: `client_service` is **attested, not claimed**. When one of
@@ -62,7 +65,7 @@ that identity, *never* from the request body. So:
 
 - A client app sees **only its own** orders. It cannot read another app's orders
   even if it tries — its partition is pinned to its attested identity.
-- **You** (the instance owner, calling directly e.g. from a dashboard) see **all**
+- **You** (the service owner, calling directly e.g. from a dashboard) see **all**
   apps' orders, with an optional `?client=<app>` filter.
 
 This cross-client isolation holds **regardless of ingress** — it's enforced again
@@ -83,11 +86,11 @@ flowchart TB
     Stripe[(Stripe)]
 
     subgraph Boogy host
-        G[stripe-gateway wasm]
+        G[stripe-base wasm]
         Store[("Per-service store
         orders + webhook_events")]
         JQ[["Durable job queue
-        apply_webhook"]]
+        create_checkout + apply_webhook"]]
         Inj{{"Secret injection
         + host-side HMAC verify"}}
     end
@@ -112,8 +115,8 @@ flowchart TB
 |------|------------|
 | [`src/lib.rs`](./src/lib.rs) | The service: router, `/checkout`, `/orders`, `/webhook` handlers, the `audience()` partition resolver, the Stripe outbound call. |
 | [`src/models.rs`](./src/models.rs) | The two `#[derive(Model)]` tables — `Order` and `WebhookEvent` — with the partitioning rules documented inline. |
-| [`src/jobs.rs`](./src/jobs.rs) | The `apply_webhook` durable handler (verified-event → order state transition, in one transaction). |
-| [`stripe-core/`](./stripe-core) | **Pure, host-testable logic:** checkout form-body shaping, `Stripe-Signature` parsing + replay tolerance, and workload-identity → `client_service` derivation. Extensively unit-tested, including adversarial signature cases. |
+| [`src/jobs.rs`](./src/jobs.rs) | The durable job handlers: `create_checkout` (async session creation, per-order Stripe `Idempotency-Key`, `queued → pending`/`failed`) and `apply_webhook` (verified-event → order state transition, in one transaction). |
+| [`stripe-base-core/`](./stripe-base-core) | **Pure, host-testable logic:** checkout form-body shaping, `Stripe-Signature` parsing + replay tolerance, and workload-identity → `client_service` derivation. Extensively unit-tested, including adversarial signature cases. |
 | [`boogy.toml`](./boogy.toml) | The manifest: per-route ingress, capabilities, the two secret declarations, the job config. |
 
 ---
@@ -128,13 +131,15 @@ Both tables are typed `#[derive(Model)]` structs; handlers use the `db_*` /
 | Column | Type | Notes |
 |--------|------|-------|
 | `id` | `u64` (pk) | Store row id. |
-| `owner_principal` | string *(indexed)* | The instance owner (you). |
+| `owner_principal` | string *(indexed)* | The service owner (you). |
 | `client_service` | string *(indexed)* | **The partition key** — which of your apps. |
-| `stripe_session_id` | string *(lookup_by)* | Natural key; the webhook-apply job resolves the order from this. |
+| `stripe_session_id` | string *(lookup_by)* | Natural key; the webhook-apply job resolves the order from this. Empty (`""`) while `queued`; the `create_checkout` job fills it. |
 | `amount` / `currency` | i64 / string | Amount in minor units. |
-| `status` | string *(indexed)* | `pending` \| `paid` \| `expired` \| `failed`. |
+| `status` | string *(indexed)* | `queued` \| `pending` \| `paid` \| `expired` \| `failed`. `queued` = session not yet created (async, job in flight); `pending` = session created, awaiting payment; `failed` = the `create_checkout` job exhausted its retries. |
+| `checkout_url` | optional string | The hosted Stripe Checkout URL; `null` while `queued`. Poll `GET /orders/{id}` to pick it up for an async order. |
+| `error` | optional string | Last failure detail when `status == "failed"`; `null` otherwise. |
 | `metadata` | optional string | Your opaque JSON, stored verbatim. |
-| `created_at` / `updated_at` | timestamps | `updated_at` bumps when the webhook flips status. |
+| `created_at` / `updated_at` | timestamps | `updated_at` bumps when the job/webhook flips status. |
 
 ### `webhook_events` — received Stripe events
 
@@ -142,7 +147,7 @@ Both tables are typed `#[derive(Model)]` structs; handlers use the `db_*` /
 |--------|------|-------|
 | `id` | `u64` (pk) | Store row id. |
 | `stripe_event_id` | string *(lookup_by)* | Dedupe key — a Stripe redelivery is a no-op. |
-| `owner_principal` | string *(indexed)* | Instance owner. |
+| `owner_principal` | string *(indexed)* | Service owner. |
 | `client_service` | string | Recovered from the matched order in the apply job (the webhook carries no identity). |
 | `event_type` | string | e.g. `checkout.session.completed`. |
 | `payload` | string | Raw event JSON. |
@@ -160,7 +165,7 @@ fall into two groups with very different auth (see [Ingress posture](#ingress-po
 
 | Method & path | Body | Returns |
 |---------------|------|---------|
-| `POST /checkout` | `CheckoutReq` (below) | `{ checkout_url, order_id }` — redirect the buyer to `checkout_url`. |
+| `POST /checkout` | `CheckoutReq` (below) | `{ order_id, status, checkout_url? }`. Async default → `status:"queued"`, `checkout_url:null` (poll `GET /orders/{id}`). `synchronous:true` → `status:"pending"` with the `checkout_url` to redirect the buyer to. |
 | `GET /orders` | — | `{ items, count }`, newest first. A client app sees only its partition; you see all apps (`?client=<app>` to filter). |
 | `GET /orders/{id}` | — | One order, scoped to the caller's partition (`404` if missing **or** outside your partition). |
 
@@ -174,10 +179,21 @@ fall into two groups with very different auth (see [Ingress posture](#ingress-po
   "success_url":  "https://app.example.com/ok",
   "cancel_url":   "https://app.example.com/cancel",
   "metadata":     { "plan": "pro" },   // optional, opaque, stored verbatim
-  "client_ref":   "storefront"         // honored ONLY for a direct owner call with
+  "client_ref":   "storefront",        // honored ONLY for a direct owner call with
                                        // no attested workload; ignored for peer callers
+  "synchronous":  false                // default false → durable job (tx-safe);
+                                       // true → call Stripe inline, return the URL now
 }
 ```
+
+> **Async by default (transaction-safe).** `POST /checkout` records a durable
+> `queued` order and enqueues the `create_checkout` job, making **no** outbound
+> Stripe call on the request path — so a checkout can be enqueued *inside* a
+> caller's `tx` (the queued order + the staged job commit atomically). The job
+> creates the session (with a per-order Stripe `Idempotency-Key`, so a retry never
+> double-charges) and flips the order to `pending` with the `checkout_url`. Set
+> `synchronous: true` to create the session inline and get the URL in the response
+> (it falls back to the durable job if the inline call fails).
 
 > `client_ref` exists so *you* (the owner, calling directly) can attribute a
 > checkout to a named app. An attested peer caller's `client_service` is derived
@@ -198,27 +214,41 @@ authenticated **in-handler** by verifying the `Stripe-Signature` HMAC host-side.
 
 ### Creating a checkout
 
+**Async default** — the request path makes no outbound call, so it's
+transaction-safe; the durable job creates the session:
+
 ```mermaid
 sequenceDiagram
     autonumber
     participant App as Your app (peer caller)
-    participant G as stripe-gateway (wasm)
+    participant G as stripe-base (wasm)
+    participant DB as Store
+    participant JQ as Job queue
     participant Host as Boogy host
     participant Stripe as Stripe
-    participant DB as Store
 
     App->>G: POST /checkout {amount, currency, product_name, urls}
-    Note over G: ingress already admitted this caller<br/>(owner-scoped origin or allowlist)
+    Note over G: ingress = authenticated (no owner hardcoded)
     G->>G: audience() → ClientApp("storefront")<br/>from ATTESTED workload identity
-    G->>Host: outbound POST /v1/checkout/sessions<br/>secret_headers=[(Authorization, stripe_secret_key)]
+    G->>DB: insert Order (status="queued", session_id="", checkout_url=null)
+    G->>JQ: enqueue create_checkout (idempotency_key = order id)
+    G-->>App: 200 {order_id, status:"queued", checkout_url:null}
+
+    Note over JQ,Stripe: later — durable session creation
+    JQ->>G: create_checkout({order_id, amount, urls, …})
+    G->>Host: outbound POST /v1/checkout/sessions<br/>Idempotency-Key: order:<id><br/>secret_headers=[(Authorization, stripe_secret_key)]
     Host->>Stripe: form-encoded body (Bearer sk_… injected)
-    Stripe-->>Host: 200 {id: "cs_…", url: "https://checkout.stripe.com/…"}
+    Stripe-->>Host: 200 {id:"cs_…", url:"https://checkout.stripe.com/…"}
     Host-->>G: 200
-    G->>DB: insert Order (status="pending", client_service="storefront")
-    DB-->>G: order_id
-    G-->>App: 200 {checkout_url, order_id}
-    Note over App: redirect the buyer to checkout_url
+    G->>DB: Order → status="pending", session_id="cs_…", checkout_url=…
+    Note over App: poll GET /orders/{id} for checkout_url, then redirect the buyer
 ```
+
+With `synchronous: true` the `outbound → Stripe → Order=pending(url)` steps run
+inline in the request and the URL is returned directly (falling back to the
+durable job if the inline call fails). Either way the **same** per-order
+`Idempotency-Key` is used, so an inline call and a later job retry resolve to the
+same Stripe session — never a duplicate, never a double charge.
 
 The partition is resolved by `audience()`: an attested workload wins; a direct
 owner caller may pass `client_ref`; otherwise the owner sentinel (`_owner/direct`,
@@ -233,7 +263,7 @@ part synchronously and hands the **stateful** part to a durable job.
 sequenceDiagram
     autonumber
     participant Stripe as Stripe
-    participant G as stripe-gateway (wasm)
+    participant G as stripe-base (wasm)
     participant Host as Boogy host
     participant DB as Store
     participant JQ as Job queue
@@ -255,8 +285,8 @@ sequenceDiagram
 
     Note over JQ,DB: later — durable apply
     JQ->>G: apply_webhook({webhook_event_id})
-    G->>DB: reload event; if checkout.session.completed →<br/>find Order by stripe_session_id
-    G->>DB: tx { Order.status="paid"; Event.status="applied",<br/>client_service recovered FROM the order }
+    G->>DB: reload event, if checkout.session.completed →<br/>find Order by stripe_session_id
+    G->>DB: tx { Order.status="paid", Event.status="applied",<br/>client_service recovered FROM the order }
     G-->>JQ: Ok(())
 ```
 
@@ -307,7 +337,7 @@ flowchart TD
 
 A client app's partition is pinned to its attested identity and any `?client=`
 query param is ignored — it can *never* read another app's orders. The owner walks
-all partitions (an explicit `allow_full_scan`, since the whole instance is theirs).
+all partitions (an explicit `allow_full_scan`, since the whole deployment is theirs).
 
 ---
 
@@ -315,15 +345,18 @@ all partitions (an explicit `allow_full_scan`, since the whole instance is their
 
 ```mermaid
 stateDiagram-v2
-    [*] --> pending: POST /checkout (Stripe session created)
+    [*] --> queued: POST /checkout (async default)
+    [*] --> pending: POST /checkout synchronous:true (session created inline)
+    queued --> pending: create_checkout job creates the Stripe session
+    queued --> failed: create_checkout job exhausts its retries
     pending --> paid: checkout.session.completed webhook applied
     paid --> [*]
+    failed --> [*]
     note right of pending
-        expired / failed are reserved for future
-        Stripe events; v1 acts only on completion.
-        Unmatched or non-completion events are
-        recorded as no_match / ignored (terminal),
-        never retried forever.
+        expired is reserved for a future Stripe event;
+        v1 acts only on completion. Unmatched or
+        non-completion events are recorded as
+        no_match / ignored (terminal), never retried forever.
     end note
 ```
 
@@ -349,11 +382,17 @@ The webhook-event side: `received` → `applied` (order flipped) | `no_match`
   the host clock (Stripe's documented default) — rejects both stale and
   clock-skewed-future signatures. The signed message is built from the **raw**
   payload bytes, so a non-UTF-8 body is preserved exactly.
-- **Cross-client isolation in depth:** even if ingress let a stranger through,
-  every management handler re-derives the attested `client_service` and scopes
-  reads/writes to it. `GET /orders/{id}` deny-masks anything outside the caller's
-  partition to a `404`, identical to "missing", so a client app can't probe for
-  another app's order ids.
+- **Authorization is host-attested, in-handler:** ingress is plain
+  `authenticated` (no owner hardcoded); every management handler derives the
+  caller's owner from the **attested** identity via `audience()` and rejects a
+  different owner's workload / a non-owner agent with `403`. A client app's
+  `client_service` is its host-set workload id, never a body field, so it can't
+  impersonate another app. `GET /orders/{id}` deny-masks anything outside the
+  caller's partition to a `404`, identical to "missing", so a client app can't
+  probe for another app's order ids.
+- **No double charge on retry:** the durable `create_checkout` job (and the inline
+  `synchronous` path) send Stripe a per-order `Idempotency-Key`, so a retried
+  session-creation returns the *same* session rather than creating a second one.
 - **Untrusted provider output is bounded:** a non-2xx Stripe error body is
   truncated to 512 bytes on a char boundary before it reaches an error string.
 
@@ -361,16 +400,16 @@ The webhook-event side: `received` → `applied` (order flipped) | `no_match`
 
 ## Ingress posture
 
-The manifest uses **per-route** ingress. The service-wide default is
-`mode = "mixed"`, with the webhook carved out to `public`:
+The manifest uses **per-route** ingress. The service-wide default is plain
+`mode = "authenticated"` — **no owner is hardcoded** (the module is provisionable
+by anyone, so it cannot bake in one owner's id). The webhook is carved out to
+`public`:
 
 ```toml
 [ingress]
-mode = "mixed"
-# internal branch — only THIS owner's own apps (owner-scoped wildcard):
-allowed_origins = ["boogy://alice/services/*"]
-# allowlist branch — the owner calling directly (dashboard/agent):
-allowed_agents = ["@alice"]
+# Any authenticated principal passes ingress; the handler's audience() does the
+# owner-scoping, host-attested. NO allowed_origins / allowed_agents allowlist.
+mode = "authenticated"
 
 # the anonymous Stripe callback (authenticated by HMAC in-handler):
 [[ingress.routes]]
@@ -378,10 +417,22 @@ path = "/webhook"
 mode = "public"
 ```
 
-So `POST /checkout`, `GET /orders`, `GET /orders/{id}` are reachable **only** by
-the owner's own apps (peer calls matching the owner-scoped origin) or the owner
-directly (allowlist). The most-specific route match wins, so `/webhook` overrides
-the default to `public`. Replace `alice` with your own owner id when you deploy.
+Cross-owner authorization is **not** an ingress allowlist; it lives in the
+handler's `audience()`, which derives the caller's owner from the **attested**
+identity and compares it to the service owner — no hardcoded id, correct for
+*every* provisioner:
+
+| Caller | `audience()` | Sees |
+|--------|-------------|------|
+| One of **your** apps (attested `boogy://<you>/services/<app>`) | `ClientApp(app)` | only that app's partition |
+| **You** (your agent, attested by `caller_is_service_owner`) | `Owner` | all your apps (`?client=` to filter) |
+| A **different** owner's workload, a non-owner agent, or anon | `Denied` | `403` |
+
+So `POST /checkout`, `GET /orders`, `GET /orders/{id}` are reachable by any
+authenticated caller but **scoped** in-handler: a different owner's workload can
+never read or create in your deployment. The most-specific route match wins, so
+`/webhook` overrides the default to `public`. There is nothing to replace when you
+deploy — the owner is your deploying principal.
 
 ---
 
@@ -390,7 +441,7 @@ the default to `public`. Replace `alice` with your own owner id when you deploy.
 1. **Build** the wasm component:
 
    ```bash
-   cargo build -p stripe-gateway --target wasm32-wasip2 --release
+   cargo build -p stripe-base --target wasm32-wasip2 --release
    ```
 
    > This service uses the SDK's host-side HMAC-verify capability for webhooks. If
@@ -405,11 +456,11 @@ the default to `public`. Replace `alice` with your own owner id when you deploy.
    ```bash
    # the secret key — bind the FULL Authorization header value:
    printf 'Bearer sk_live_...' | \
-     boogy secret set <owner>/stripe-gateway/stripe_secret_key --stdin
+     boogy secret set <owner>/stripe-base/stripe_secret_key --stdin
 
    # the webhook signing secret — the raw whsec_... value:
    printf 'whsec_...' | \
-     boogy secret set <owner>/stripe-gateway/stripe_webhook_secret --stdin
+     boogy secret set <owner>/stripe-base/stripe_webhook_secret --stdin
    ```
 
 4. **Point a Stripe webhook** at `https://<host>/<owner>/webhook` for the
@@ -422,20 +473,27 @@ the default to `public`. Replace `alice` with your own owner id when you deploy.
 ## Worked example
 
 ```bash
-# 1. Create a Checkout Session (as the owner; a peer app omits client_ref)
+# 1. Create a checkout (async default; as the owner — a peer app omits client_ref)
 curl -X POST https://<host>/<owner>/checkout \
   -H "authorization: Bearer <token>" -H 'content-type: application/json' \
   -d '{"amount":2000,"currency":"usd","product_name":"Pro Plan",
        "success_url":"https://app/ok","cancel_url":"https://app/cancel",
        "client_ref":"storefront"}'
-# → 200 {"checkout_url":"https://checkout.stripe.com/c/pay/cs_…","order_id":42}
+# → 200 {"order_id":42,"status":"queued","checkout_url":null}
+#    (the durable create_checkout job creates the Stripe session next)
+#    Need the URL synchronously instead? add "synchronous": true and the response
+#    is {"order_id":42,"status":"pending","checkout_url":"https://checkout.stripe.com/…"}.
+
+# 2. Poll the order until the job has created the session (status → "pending").
+curl "https://<host>/<owner>/orders/42" -H "authorization: Bearer <token>"
+# → {"id":42,"status":"pending","checkout_url":"https://checkout.stripe.com/c/pay/cs_…",...}
 # redirect the buyer to checkout_url
 
-# 2. Stripe later calls POST /webhook with checkout.session.completed.
+# 3. Stripe later calls POST /webhook with checkout.session.completed.
 #    The service verifies the signature, records + dedupes the event, and the
 #    durable apply job flips order 42 to "paid".
 
-# 3. Check the order (owner sees all apps; ?client= to filter)
+# 4. Check the order (owner sees all apps; ?client= to filter)
 curl "https://<host>/<owner>/orders?client=storefront" \
   -H "authorization: Bearer <token>"
 # → {"items":[{"id":42,"client_service":"storefront","status":"paid",...}],"count":1}

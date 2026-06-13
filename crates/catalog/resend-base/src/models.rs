@@ -30,8 +30,23 @@ use boogy_sdk::Model;
 ///   durable `send_email` job reloads the row and resends verbatim from
 ///   these columns, so it never has to re-render (the template + vars are
 ///   not retained — the rendered body is the single source of truth).
+/// ## Access patterns (keyset-pagination-backed)
+///
+/// Listings are keyset-paginated newest-first by `created_at`; the model
+/// declares the covering composite indexes that back the walks:
+/// - `list_by(filter = "owner_principal", …)` — the principal's own messages
+///   (`GET /messages`). `owner_principal` keeps its `#[index]` too: the SDK auth
+///   helpers (`find_owned`/`load_owned`) seek on it.
+/// - `list_by(filter = "status", …)` — the operator `?status=` filter.
+/// - `ranked_by(highest = "created_at")` — the operator's unfiltered
+///   all-principals feed (`GET /admin/messages`).
 #[derive(Model)]
-#[model(table = "messages")]
+#[model(
+    table = "messages",
+    list_by(filter = "owner_principal", newest = "created_at"),
+    list_by(filter = "status", newest = "created_at"),
+    ranked_by(highest = "created_at")
+)]
 pub struct Message {
     #[pk]
     pub id: Id<Message>,
@@ -44,21 +59,22 @@ pub struct Message {
     pub body_text: Option<String>,
     pub template_id: Option<String>,
     pub provider_message_id: Option<String>,
-    #[index]
     pub status: String, // queued | sent | failed | canceled
     pub error: Option<String>,
     pub created_at: Timestamp,
     pub sent_at: Option<Timestamp>,
 }
 
-/// A principal blocked from sending by the instance operator.
+/// A principal blocked from sending by the deployment operator.
 ///
 /// `/send` (+ `/send/batch`) pre-check the calling principal against this
 /// table and return `403` if blocked. `principal` is a unique point-lookup
 /// (`#[lookup_by]`) so the check is a single keyed read; `created_by` records
 /// which operator set the block.
+/// `ranked_by(highest = "created_at")` backs the operator's keyset-paginated
+/// block list (`GET /admin/blocks`, newest first).
 #[derive(Model)]
-#[model(table = "blocked_senders")]
+#[model(table = "blocked_senders", ranked_by(highest = "created_at"))]
 pub struct BlockedSender {
     #[pk]
     pub id: Id<BlockedSender>,
@@ -74,8 +90,14 @@ pub struct BlockedSender {
 /// `name` is a human label; `subject` / `html` are the renderable bodies
 /// (`{{var}}` placeholders substituted by `resend_base_core::render` at send
 /// time). `text` is an optional plain-text alternative.
+/// `list_by(filter = "owner_principal", newest = "created_at")` backs the
+/// principal's keyset-paginated template list (`GET /templates`, newest first).
+/// `owner_principal` keeps its `#[index]` (the SDK auth helpers seek on it).
 #[derive(Model)]
-#[model(table = "templates")]
+#[model(
+    table = "templates",
+    list_by(filter = "owner_principal", newest = "created_at")
+)]
 pub struct Template {
     #[pk]
     pub id: Id<Template>,

@@ -234,7 +234,7 @@ sequenceDiagram
     S-->>App: 200 {message_id, status:"queued"}
     Note over App,JQ: the staged job is submitted only if the tx commits
     JQ->>S: send_email(ctx, {message_id})
-    S->>DB: reload message; rebuild SendInput
+    S->>DB: reload message, rebuild SendInput
     S->>R: POST /emails (Bearer re_… injected by host)
     R-->>S: 200 {id}
     S->>DB: update Message (status="sent")
@@ -295,28 +295,27 @@ One instance serves **one app**, and within it the **sending principal** is the
 sub-tenant. End users see only their own mail; the **app admin** needs to see
 across everyone and to stop abuse. That's the `/admin/*` surface.
 
-**Access is gated by runtime self-identity — no identity is hardcoded** (the
-module is provisionable by anyone):
+**Access is gated by the host-attested `caller_is_service_owner` capability — no
+identity is hardcoded** (the module is provisionable by anyone):
 
-- `/admin/*` ingress is `mode = "internal", allowed_origins = ["*"]` — admits any
-  deployed **workload**, rejects humans/anonymous, and names nobody.
-- In-handler, `require_operator()` learns this instance's owner from the
-  `self_identity()` capability (host-pinned to whoever provisioned it) and admits
-  only callers whose **attested workload owner matches** — i.e. *your own backend
-  services*. A cross-owner workload gets `403`.
+- `/admin/*` ingress is just `mode = "authenticated"` (rejects anonymous; no
+  per-route override, names nobody).
+- In-handler, `require_operator()` calls `caller_is_service_owner()` — the host
+  attests whether the caller is **this service's owner**: their own **agent token**
+  (the platform resolves the handle host-side, against the agents registry) OR one
+  of their own **workloads**. An OBO hop where the owner's backend acts for a user
+  is admitted via the attested `actor`. Anyone else → `403`.
 
-So your app's admin features call `/admin/*` as your backend (a workload). A raw
-human/agent token carries no owner handle a wasm component could verify, so direct
-human admin goes **through** your backend.
+So the **human owner can curl `/admin` directly** with their own token, *and* the
+owner's backend can call it as a workload — neither requires naming an owner in the
+manifest.
 
 ```mermaid
 flowchart TD
-    C["caller hits /admin/*"] --> I{"ingress: internal
-    (any workload, no humans)"}
-    I -->|human/anon| D1["rejected at ingress"]
-    I -->|workload| RO{"require_operator():
-    workload owner == self_identity().owner?"}
-    RO -->|no| D2["403"]
+    C["caller hits /admin/* (authenticated)"] --> RO{"require_operator():
+    caller_is_service_owner()?
+    (owner's agent OR own workload)"}
+    RO -->|no, and not an owner-backend OBO actor| D2["403"]
     RO -->|yes| OK["operator: list-all / block / cancel"]
 ```
 
@@ -330,7 +329,8 @@ flowchart TD
 - **Outbound is allow-listed:** `[outbound] allowed_hosts = ["api.resend.com"]`.
 - **End-user isolation:** reads are scoped to `auth::current_principal()`; missing
   and not-owned both `404`.
-- **Operator access by same-owner self-identity** (above) — not a manifest identity.
+- **Operator access by host-attested `caller_is_service_owner`** (above) — not a
+  manifest identity; the owner's agent token and own workloads both qualify.
 - **Sender blocking:** a blocked principal's `/send` returns `403` before any row
   is written.
 - **Untrusted provider output is bounded:** a non-2xx Resend body is truncated to
@@ -369,10 +369,13 @@ curl -X POST https://<host>/<owner>/send/batch \
        "recipients":[{"to":"a@x.com","vars":[["name","A"]]},{"to":"b@y.com","vars":[["name","B"]]}]}'
 # → 200 {"items":[...],"count":2,"accepted":2,"rejected":0}
 
-# Operator (called by your backend, as a workload): block a sender
+# Operator surface (/admin/*) — the SERVICE OWNER curls it directly with their
+# own token (the host attests caller_is_service_owner host-side). Block a sender:
 curl -X POST https://<host>/<owner>/admin/blocks \
-  -H "authorization: Bearer <workload-token>" -H 'content-type: application/json' \
+  -H "authorization: Bearer <owner-token>" -H 'content-type: application/json' \
   -d '{"principal":"agent_018f...","reason":"abuse"}'
+# A non-owner gets 403. The owner's own backend can also call it as a workload
+# (over peer) — neither path hardcodes an identity in the manifest.
 ```
 
 ---

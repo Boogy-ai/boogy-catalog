@@ -8,8 +8,8 @@ resolver = "2"
 members = [
     "crates/catalog/resend-base",
     "crates/catalog/resend-base/resend-base-core",
-    "crates/catalog/stripe-gateway",
-    "crates/catalog/stripe-gateway/stripe-core",
+    "crates/catalog/stripe-base",
+    "crates/catalog/stripe-base/stripe-base-core",
 ]
 
 [workspace.dependencies]
