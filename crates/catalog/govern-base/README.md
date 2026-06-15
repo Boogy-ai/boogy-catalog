@@ -357,15 +357,15 @@ sequenceDiagram
     participant T as Treasury service (peer)
 
     A->>G: POST /proposals {title, body, actions:[peer→treasury]}
-    Note over G: audience() → Voter(alice); actions VALIDATED + FROZEN
+    Note over G: audience() → Voter(alice) — actions VALIDATED + FROZEN
     G->>DB: tx { insert Proposal(draft) + N ProposalActions }
     G-->>A: {id:7, status:"draft"}
 
     A->>G: POST /proposals/7/submit
     G->>DB: status → sponsorship (threshold>0)
     B->>G: POST /proposals/7/sponsor
-    Note over G: not the author (self-sponsor blocked); distinct sponsor
-    G->>DB: tx { insert Sponsorship; sponsor_count ≥ threshold →<br/>status=voting, snapshot total_eligible_power = roll size,<br/>voting_end = now + max(period, min_voting_period) }
+    Note over G: not the author (self-sponsor blocked) — distinct sponsor
+    G->>DB: tx { insert Sponsorship, sponsor_count ≥ threshold →<br/>status=voting, snapshot total_eligible_power = roll size,<br/>voting_end = now + max(period, min_voting_period) }
     G->>G: ws publish tally.update / proposal.status
 
     A->>G: POST /proposals/7/vote {option:"yes"}
@@ -378,11 +378,11 @@ sequenceDiagram
 
     Note over JQ,G: timelock elapses
     JQ->>G: lifecycle_tick
-    G->>DB: tx { status=executing } ; enqueue execute_proposal
+    G->>DB: tx { status=executing } then enqueue execute_proposal
     JQ->>G: execute_proposal({proposal_id:7})
     G->>T: peer POST (verbatim body, within manifest envelope)
     T-->>G: 2xx
-    G->>DB: action done; all done → status=executed
+    G->>DB: action done, all done → status=executed
 ```
 
 ### Exactly-once execution
@@ -407,7 +407,7 @@ sequenceDiagram
             X-->>G: 2xx → mark done  ·  non-2xx/err → mark failed
             Note over G,DB: failed → status=failed, STOP (operator replay)
         else Claim::Busy (already running)
-            G->>DB: status=failed (in-flight; do NOT re-fire)
+            G->>DB: status=failed (in-flight, do NOT re-fire)
             G-->>JQ: Terminal — operator verifies + replays
         else Claim::Done
             Note over G: skip (idempotent resume)
