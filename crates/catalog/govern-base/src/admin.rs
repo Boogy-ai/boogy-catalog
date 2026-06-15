@@ -42,11 +42,7 @@ pub fn default_config(owner: &str) -> Config {
 /// threshold is configured.
 pub fn is_exempt_proposer(author: &str, cfg: &Config) -> bool {
     author == crate::self_identity().owner
-        || cfg
-            .exempt_proposers
-            .split(',')
-            .map(|s| s.trim())
-            .any(|p| !p.is_empty() && p == author)
+        || govern_base_core::proposer_in_exempt_list(author, &cfg.exempt_proposers)
 }
 
 /// True if `principal` is on this deployment's Member roll (bounded electorates).

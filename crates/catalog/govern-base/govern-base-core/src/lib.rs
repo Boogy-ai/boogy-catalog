@@ -360,6 +360,17 @@ pub fn validate_action(a: &ActionSpec) -> Result<(), String> {
     }
 }
 
+/// True if `author` appears in a comma-separated exempt-proposers list (entries
+/// are trimmed; empty entries never match). The pure, listable half of the
+/// co-sponsorship fast-track — the owner-identity check stays in the service layer
+/// (it needs host-attested identity), but the configurable allow-list match is
+/// here so it is unit-tested.
+pub fn proposer_in_exempt_list(author: &str, list: &str) -> bool {
+    list.split(',')
+        .map(|s| s.trim())
+        .any(|e| !e.is_empty() && e == author)
+}
+
 #[cfg(test)]
 mod action_tests {
     use super::*;
@@ -409,5 +420,28 @@ mod action_tests {
             method: "POST".into(),
         })
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod exempt_list_tests {
+    use super::*;
+
+    #[test]
+    fn matches_single_and_whitespaced_multi_entry_lists() {
+        assert!(proposer_in_exempt_list("alice", "alice"));
+        assert!(proposer_in_exempt_list(
+            "boogy://acme/services/council",
+            "agent_x, boogy://acme/services/council , agent_y"
+        ));
+    }
+
+    #[test]
+    fn rejects_non_member_empty_and_substring() {
+        assert!(!proposer_in_exempt_list("mallory", "alice,bob")); // not listed
+        assert!(!proposer_in_exempt_list("alice", "")); // empty list
+        assert!(!proposer_in_exempt_list("", "")); // empty author vs empty entries
+        assert!(!proposer_in_exempt_list("", "alice,bob")); // empty author never matches
+        assert!(!proposer_in_exempt_list("alice", "alice2")); // substring is not a match
     }
 }
