@@ -1,0 +1,85 @@
+[service]
+id = "govern-base"
+name = "Governance"
+version = "0.1.0"
+wasm = "../../../target/wasm32-wasip2/release/govern_base.wasm"
+description = """
+Run governance for your community, DAO, cooperative, or app. Members propose \
+changes, gather co-sponsors, and vote (one member, one vote) with quorum, a \
+pass threshold, and a veto gate. A passed proposal can wait out a timelock and \
+then trigger real effects — calling another service in your mesh or an outside \
+API — exactly as written in the proposal. Bring your own membership and policy.\
+"""
+keywords = ["governance", "voting", "dao", "proposals"]
+category = "governance"
+repository = "https://github.com/Boogy-ai/boogy-catalog/tree/main/crates/catalog/govern-base"
+license = "MIT OR Apache-2.0"
+authors = ["Boogy"]
+
+owner = "alice"
+
+[routing]
+path = "/"
+methods = ["*"]
+
+[ingress]
+# All mutations require an authenticated principal; NO owner is hardcoded
+# (provisionable by anyone). audience() does authorization in-handler.
+mode = "authenticated"
+
+# Read routes are reachable anonymously so a public deployment can expose
+# results; the handler still enforces Config.read_access (anon allowed only when
+# the operator set read_access = "public"). Most-specific match wins.
+[[ingress.routes]]
+path = "/proposals"
+mode = "public"
+[[ingress.routes]]
+path = "/proposals/{id}"
+mode = "public"
+[[ingress.routes]]
+path = "/proposals/{id}/tally"
+mode = "public"
+[[ingress.routes]]
+path = "/proposals/{id}/comments"
+mode = "public"
+
+[capabilities]
+store = true
+auth = true
+clock = true
+entropy = true
+peer = true
+outbound_http = true
+background_jobs = true
+websockets = true
+
+# A passed proposal's outbound actions can only reach hosts the OPERATOR lists
+# here — the execution blast-radius floor. Replace with the operator's real
+# targets at provision time. (Required to be non-empty when outbound_http is on.)
+[outbound]
+allowed_hosts = ["api.example.com"]
+
+# Live tally + status fan-out per proposal. Public class: anyone may watch a
+# proposal's tally; room key is the proposal id.
+[[websockets.channels]]
+name = "proposals"
+class = "public"
+replay = 8
+
+# Durable execution of a passed proposal's actions (after timelock).
+[background_jobs.handlers.execute_proposal]
+deadline_ms = 20000
+max_attempts = 5
+backoff_ms = 3000
+
+# Periodic sweep advancing time-based transitions (voting_end → tally,
+# timelock_end → enqueue execution). Event name carries no payload.
+[background_jobs.handlers.lifecycle_tick]
+deadline_ms = 15000
+max_attempts = 3
+backoff_ms = 5000
+schedule = "*/30 * * * * *"
+
+[limits]
+memory_mb = 32
+timeout_ms = 15000

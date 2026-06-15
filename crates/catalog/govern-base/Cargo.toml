@@ -1,0 +1,16 @@
+[package]
+name = "govern-base"
+version = "0.1.0"
+edition = "2021"
+description = "Run on-chain-style governance for your community or app: members propose, co-sponsor, vote, and a passed proposal can trigger real effects."
+
+[dependencies]
+boogy-sdk = { path = "../../boogy-sdk" }
+govern-base-core = { path = "govern-base-core" }
+wit-bindgen = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+
+[lib]
+crate-type = ["cdylib"]
