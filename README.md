@@ -11,6 +11,11 @@ one is written exactly the way the [Boogy SDK](https://github.com/Boogy-ai/boogy
 recommends, so you can read them to learn how a production Boogy service is
 structured.
 
+See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the provisioning + isolation
+model and the BYO-key flow (with diagrams), and
+**[`crates/catalog/README.md`](crates/catalog/README.md)** for a per-service
+surface breakdown.
+
 > **Status: early development.** APIs change without notice. These services
 > track the SDK; pin a matching git `rev` if you build against them.
 
@@ -18,6 +23,8 @@ structured.
 
 | Crate | What it is |
 |-------|------------|
+| `crates/catalog/govern-base` | Governance engine: members **propose → co-sponsor → vote** (quorum, pass threshold, veto), then a **timelock** elapses and the proposal **executes its encoded effects** — a call to another service in your mesh or an external API. Live WebSocket tallies + an MCP read surface; no third-party key required. |
+| `crates/catalog/govern-base/govern-base-core` | Pure, host-testable logic (tally math, eligibility, proposal state transitions). |
 | `crates/catalog/resend-base` | BYO-key transactional email (Resend wrapper): **async-by-default (transaction-safe) send** + a synchronous option, batch send, `{{variable}}` templates, a per-sender message log, and an operator surface (list-all + sender blocking). The owner's API key is bound as a secret the service never reads. |
 | `crates/catalog/resend-base/resend-base-core` | Pure, host-testable logic (template rendering, request-body shaping) — unit-tested off-wasm. |
 | `crates/catalog/stripe-base` | BYO-key payments (Stripe Checkout wrapper): create hosted Checkout Sessions, record orders, and apply signature-verified completion webhooks durably. One deployment can front many of the provisioner's apps, with each app's orders kept separate. |
