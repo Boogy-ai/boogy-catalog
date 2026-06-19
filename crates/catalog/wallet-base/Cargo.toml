@@ -1,0 +1,24 @@
+[package]
+name = "wallet-base"
+version = "0.1.0"
+edition = "2021"
+description = "Catalog service: a multi-chain custodial wallet. Per-tenant EVM key custody + signing, deployed BYO-config."
+
+[dependencies]
+boogy-sdk = { path = "../../boogy-sdk" }
+# Pure, host-testable EVM logic (alloy-backed: key derivation, address
+# computation, transaction RLP encoding + signing) lives in the sibling
+# wallet-base-core crate (rlib); its unit tests run via `cargo test --workspace`.
+wallet-base-core = { path = "wallet-base-core" }
+wit-bindgen = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+hex = "0.4"
+
+[lib]
+# cdylib only — wasm component output. `wit_bindgen::generate!` emits
+# wasm-component-only symbols that don't host-link, so adding `rlib` here
+# breaks `cargo test --workspace`. Host-testable pure logic lives in
+# wallet-base-core (rlib).
+crate-type = ["cdylib"]

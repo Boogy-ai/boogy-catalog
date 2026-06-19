@@ -1,0 +1,106 @@
+[service]
+id = "wallet-base"
+name = "Wallet"
+version = "0.1.0"
+wasm = "../../../target/wasm32-wasip2/release/wallet_base.wasm"
+# Registry metadata — how a developer finds and understands this module. Write
+# it the way they think ("I need a custodial crypto wallet"), in plain words.
+# Keywords are a few distinct tags, NOT phrases that restate the name/description
+# (the registry already full-text-searches those).
+description = """
+A multi-chain custodial wallet — hold keys and sign transactions across EVM, \
+Cosmos, Solana, and Bitcoin chains. Each deployment custodies its own tenant's \
+keys in isolated storage and signs on their behalf; keys never leave the \
+service.\
+"""
+keywords = ["wallet", "evm", "cosmos", "solana", "bitcoin", "custody"]
+category = "wallet"
+# Optional display metadata (crates.io-style) surfaced by the registry.
+repository = "https://github.com/Boogy-ai/boogy-catalog/tree/main/crates/catalog/wallet-base"
+license = "MIT OR Apache-2.0"
+authors = ["Boogy"]
+
+owner = "alice"
+
+[routing]
+# Claim the whole owner subtree so all wallet routes mount at the root.
+path = "/"
+methods = ["*"]
+
+[ingress]
+# Management routes require an authenticated principal; NO identity is hardcoded
+# (the module is provisionable by anyone). In-handler authorization scopes by
+# the attested caller identity.
+mode = "authenticated"
+
+[capabilities]
+store = true
+auth = true
+signing = true
+outbound_http = true
+background_jobs = true
+clock = true
+entropy = true
+websockets = true
+
+# outbound_http is granted, so an [outbound] block with a non-empty
+# allowed_hosts is required. These are PLACEHOLDER hosts: the provisioner
+# overrides allowed_hosts with the real chain endpoints at deploy time — the
+# EVM JSON-RPC host (backs `evm_rpc_key`), the Cosmos LCD/REST host (backs
+# `cosmos_rpc_key`), the Solana JSON-RPC host (backs `solana_rpc_key`), and the
+# Bitcoin Esplora (REST) host (backs `btc_rpc_key`). Kept parseable so `boogy
+# check` passes on the in-repo crate.
+[outbound]
+allowed_hosts = ["rpc.example.com", "lcd.example.com", "solana-rpc.example.com", "esplora.example.com"]
+
+# BYO-key secrets. The provisioner binds these out-of-band via the admin
+# secrets endpoint; the wasm only ever sees the name. `evm_rpc_key` is injected
+# VERBATIM as the `Authorization` header on outbound JSON-RPC calls (the
+# operator binds the full header value, e.g. `Bearer <key>`); the wasm never
+# reads it.
+[secrets]
+evm_rpc_key = { usage = ["outbound-header"] }
+# Injected VERBATIM as the `Authorization` header on outbound Cosmos LCD (REST)
+# calls; the operator binds the full header value. The wasm never reads it.
+cosmos_rpc_key = { usage = ["outbound-header"] }
+# Injected VERBATIM as the `Authorization` header on outbound Solana JSON-RPC
+# calls; the operator binds the full header value. The wasm never reads it.
+solana_rpc_key = { usage = ["outbound-header"] }
+# Injected VERBATIM as the `Authorization` header on outbound Bitcoin Esplora
+# (REST) calls; the operator binds the full header value. The wasm never reads it.
+btc_rpc_key = { usage = ["outbound-header"] }
+
+# Per-principal `tx.status` stream. `class = "principal"` scopes delivery to the
+# addressed owner_principal; `replay` lets a reconnecting client catch the last
+# few status transitions (signed → pending → confirmed/failed).
+[[websockets.channels]]
+name = "wallet"
+class = "principal"
+replay = 8
+
+# Durable EVM send pipeline. `broadcast_tx` submits the signed raw tx; on RPC
+# failure it retries with backoff up to max_attempts, then records `failed`.
+# `poll_confirmation` polls the receipt, re-enqueuing itself (bounded) until the
+# tx is mined. deadline_ms bounds one outbound RPC call.
+[background_jobs.handlers.broadcast_tx]
+deadline_ms = 15000
+max_attempts = 8
+backoff_ms = 3000
+
+[background_jobs.handlers.poll_confirmation]
+deadline_ms = 15000
+max_attempts = 8
+backoff_ms = 3000
+
+# OBO/delegation is OPT-IN per receiver and DEFAULT-DENY here: with an empty
+# allow_actor, delegated (on-behalf-of) calls are rejected. The provisioner adds
+# the specific actor services it wants to delegate to (and the matching
+# max_delegated_scopes cap) at deploy time. Documented explicitly so the OBO
+# posture is visible rather than implicit.
+[ingress.delegation]
+allow_actor = []
+max_delegated_scopes = []
+
+[limits]
+memory_mb = 32
+timeout_ms = 10000

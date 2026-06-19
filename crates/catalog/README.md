@@ -133,6 +133,54 @@ durable transaction-safe checkout creation (async default works inside a caller
 
 ---
 
+### wallet-base — Multi-chain custodial wallet
+
+Hold keys and sign transactions across **EVM, Cosmos, Solana, and Bitcoin** from a
+single deployment, using your own RPC endpoints. Each of your users gets a custodial
+wallet per chain; on first use the platform generates the signing key and holds it in
+its key-custody layer — **the private key never enters the wasm, never appears in
+logs, and is non-exportable.** Build, simulate, policy-check, sign, and broadcast
+transactions through a REST API or MCP tools. Signing happens host-side over the exact
+digest (or message) that the audited chain library produced — the wasm assembles the
+unsigned transaction and re-attaches the signature, but never holds the key
+(external-signer mode). Spend guardrails (per-tx + rolling daily caps, recipient
+allowlists, refuse-on-revert) run **before the key is touched**, and operators get a
+cross-principal view plus a per-principal block list.
+
+**BYO secrets:**
+- `evm_rpc_key` · `cosmos_rpc_key` · `solana_rpc_key` · `btc_rpc_key` — your endpoint
+  credentials for each chain you enable. Declared as outbound-header secrets: the host
+  injects each as the `Authorization` header on calls to that chain's RPC/REST
+  endpoint; the wasm never reads the value.
+
+**Surface:**
+
+| Route | What it does |
+|-------|-------------|
+| `POST /wallets` · `GET /wallets` · `GET /wallets/{chain}` | Ensure / list / read the caller's wallet per chain (key created on first call) |
+| `POST /evm/{sign,send,simulate,fees}` · `GET`·`PUT /evm/policy` | EVM (Ethereum-compatible): sign-only, full send pipeline, gas simulate/fees, spend policy |
+| `POST /cosmos/{sign,send,simulate,fees}` · `GET`·`PUT /cosmos/policy` | Cosmos SDK chains — bank send, SIGN_MODE_DIRECT |
+| `POST /solana/{sign,send,simulate,fees}` · `GET`·`PUT /solana/policy` | Solana — SystemProgram transfer, Ed25519 signing |
+| `POST /btc/{sign,send,fees}` · `GET`·`PUT /btc/policy` | Bitcoin — native-SegWit P2WPKH, UTXO model |
+| `/admin/*` | Operator: all wallets/transactions, set any principal's policy, block/unblock, audit log |
+| `/mcp` | MCP tools: get address/balance, estimate fee, simulate, send, list transactions |
+
+**WebSocket channel:** `wallet` (`class = "principal"`) pushes `tx.status` envelopes
+(`signed` → `pending` → `confirmed`/`failed`) to the owning principal's own room as a
+transaction moves through the durable broadcast → confirmation pipeline.
+
+**Patterns demonstrated:** external-signer custody (a trusted, audited chain library
+for each network builds the exact bytes to sign and the host's key-custody layer signs
+them — the key never enters the wasm; nothing is hand-rolled), one signing key per
+`(principal, chain)` with the signing subject derived from the **attested caller**
+(never the request body — the sign-as-anyone guard), app-level spend guardrails
+enforced **before** signing, a durable broadcast → confirmation job pipeline per chain,
+two-audience design (per-user routes **and** an operator `/admin/*` surface), and pure
+per-chain encoding logic in a `wallet-base-core` crate for fast off-wasm testing,
+including adversarial/negative vectors.
+
+---
+
 ## How provisioning works
 
 A catalog service is a **template**: the same wasm binary is correct for every
@@ -215,7 +263,7 @@ SDK's `smoke/` template uses). The `wit/` directories are generated and gitignor
 
 ```bash
 # build the deployable wasm components
-cargo build -p resend-base -p stripe-base --target wasm32-wasip2 --release
+cargo build -p resend-base -p stripe-base -p wallet-base --target wasm32-wasip2 --release
 
 # run the pure-logic unit tests (the *-core crates)
 cargo test --workspace
