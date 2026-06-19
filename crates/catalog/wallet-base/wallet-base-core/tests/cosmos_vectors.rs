@@ -166,8 +166,23 @@ fn cosmos_assemble_roundtrips_into_txraw() {
 
     let unsigned = CosmosAdapter::build_unsigned(&fixture_intent()).unwrap();
 
-    // Dummy 64-byte compact r||s (no recovery id needed for Cosmos).
-    let sig = Secp256k1Signature { r: [0xAB; 32], s: [0xCD; 32], recovery_id: 0 };
+    // A REAL signature over the SignDoc sighash with the fixture key — the
+    // post-assembly self-verify (#15) now rejects a sig that doesn't match the
+    // sighash, so a dummy r||s no longer round-trips.
+    let digest = match &unsigned.sign_requests[0] {
+        SignRequest::Digest(d) => *d,
+        other => panic!("expected Digest, got {other:?}"),
+    };
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let sk = bitcoin::secp256k1::SecretKey::from_slice(&hex::decode(TEST_SK_HEX).unwrap()).unwrap();
+    let mut signed = secp.sign_ecdsa(&bitcoin::secp256k1::Message::from_digest(digest), &sk);
+    signed.normalize_s();
+    let compact = signed.serialize_compact();
+    let sig = Secp256k1Signature {
+        r: compact[0..32].try_into().unwrap(),
+        s: compact[32..64].try_into().unwrap(),
+        recovery_id: 0,
+    };
     let raw = CosmosAdapter::assemble_signed(&unsigned, &[sig]).unwrap();
 
     // Decode the TxRaw back and assert structure survives.
@@ -176,12 +191,8 @@ fn cosmos_assemble_roundtrips_into_txraw() {
     assert_eq!(decoded.signatures[0].len(), 64, "64-byte compact r||s");
     assert!(!decoded.body_bytes.is_empty(), "body_bytes survives");
     assert!(!decoded.auth_info_bytes.is_empty(), "auth_info_bytes survives");
-
-    // r||s spliced verbatim.
-    let mut expected = Vec::with_capacity(64);
-    expected.extend_from_slice(&[0xAB; 32]);
-    expected.extend_from_slice(&[0xCD; 32]);
-    assert_eq!(decoded.signatures[0], expected);
+    // The emitted signature is the low-S-normalized r||s we verified.
+    assert_eq!(decoded.signatures[0], compact.to_vec());
 }
 
 #[test]
@@ -226,4 +237,140 @@ fn cosmos_build_unsigned_rejects_unparseable_amount() {
     let mut fee = fixture_intent();
     fee.fee_amount = "".into();
     assert!(CosmosAdapter::build_unsigned(&fee).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// SignDoc sign-bytes — independent re-derivation + external-KAT stub (#18)
+// ---------------------------------------------------------------------------
+
+/// Append a protobuf varint (base-128, little-endian groups) to `out`.
+fn put_varint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let mut byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v != 0 {
+            byte |= 0x80;
+        }
+        out.push(byte);
+        if v == 0 {
+            break;
+        }
+    }
+}
+
+/// Append a length-delimited (wire type 2) field `field_no` carrying `bytes`.
+fn put_len_field(out: &mut Vec<u8>, field_no: u32, bytes: &[u8]) {
+    put_varint(out, ((field_no as u64) << 3) | 2); // tag = field<<3 | LEN
+    put_varint(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+/// #18 (independent in-repo derivation): the SIGN_MODE_DIRECT sign-bytes are
+/// `sha256(proto(SignDoc{body_bytes, auth_info_bytes, chain_id, account_number}))`.
+/// Re-encode that SignDoc HERE by the raw protobuf wire spec — a completely
+/// different code path than cosmrs's `SignDoc::into_bytes()` that `build_unsigned`
+/// uses — and assert the digest matches. This catches a field-order / tag /
+/// varint / framing bug or a cosmrs encoding drift that the stability SNAPSHOT
+/// (`cosmos_build_unsigned_matches_signdoc_snapshot`) cannot, because the
+/// snapshot is captured from our own output. Not a full cross-impl KAT (the
+/// body/auth_info bytes still come from cosmrs) — see the external stub below.
+#[test]
+fn cosmos_signdoc_framing_matches_independent_proto_encoding() {
+    let intent = fixture_intent();
+    let unsigned = CosmosAdapter::build_unsigned(&intent).unwrap();
+    let digest = match &unsigned.sign_requests[0] {
+        SignRequest::Digest(d) => *d,
+        other => panic!("expected Digest, got {other:?}"),
+    };
+
+    // Pull the canonical body/auth_info bytes out of the preimage JSON (a
+    // serde_json array of byte values) without depending on the private struct.
+    let v: serde_json::Value = serde_json::from_slice(&unsigned.preimage).unwrap();
+    let field_bytes = |k: &str| -> Vec<u8> {
+        v[k]
+            .as_array()
+            .unwrap_or_else(|| panic!("preimage.{k} is not an array"))
+            .iter()
+            .map(|x| x.as_u64().expect("byte") as u8)
+            .collect()
+    };
+    let body_bytes = field_bytes("body_bytes");
+    let auth_info_bytes = field_bytes("auth_info_bytes");
+
+    // Hand-encode SignDoc: 1=body_bytes, 2=auth_info_bytes, 3=chain_id (string),
+    // 4=account_number (uint64 varint). Field order is ascending by number.
+    let mut sign_doc = Vec::new();
+    put_len_field(&mut sign_doc, 1, &body_bytes);
+    put_len_field(&mut sign_doc, 2, &auth_info_bytes);
+    put_len_field(&mut sign_doc, 3, intent.chain_id.as_bytes());
+    put_varint(&mut sign_doc, (4u64 << 3) | 0); // field 4, VARINT
+    put_varint(&mut sign_doc, intent.account_number);
+
+    let expected: [u8; 32] = Sha256::digest(&sign_doc).into();
+    assert_eq!(
+        digest, expected,
+        "build_unsigned's SignDoc digest must equal the independent proto re-encoding"
+    );
+}
+
+/// #18 (full external cross-impl KAT). A SIGN_MODE_DIRECT vector produced by an
+/// INDEPENDENT implementation — cosmjs `@cosmjs/proto-signing` `testVectors[0]`
+/// (see that repo's `TEST_VECTORS.md` for how it was generated): a bank MsgSend
+/// of 1234567 ucosm, fee 2000 ucosm / gas 200000, account_number 1, sequence 0,
+/// chain `simd-testing`.
+///
+/// We reconstruct the SAME intent, run OUR `build_unsigned`, and (a) assert our
+/// SignDoc digest equals `sha256(cosmjs signBytes)` and (b) verify cosmjs's
+/// signature against OUR digest under the signer pubkey. If our
+/// body/auth_info/SignDoc construction differed from cosmjs by a single byte,
+/// the digest would differ and BOTH assertions would fail — so this one vector
+/// validates our entire sign-bytes pipeline against another implementation. The
+/// signature was produced by cosmjs, never by our code (not a re-snapshot).
+#[test]
+fn cosmos_signdoc_external_kat() {
+    // cosmjs testVectors[0] (verbatim hex).
+    const PUBKEY_HEX: &str =
+        "034f04181eeba35391b858633a765c4a0c189697b40d216354d50890d350c70290";
+    const SIGN_BYTES_HEX: &str = "0a93010a90010a1c2f636f736d6f732e62616e6b2e763162657461312e4d736753656e6412700a2d636f736d6f7331706b707472653766646b6c366766727a6c65736a6a766878686c63337234676d6d6b38727336122d636f736d6f7331717970717870713971637273737a673270767871367273307a716733797963356c7a763778751a100a0575636f736d12073132333435363712650a4e0a460a1f2f636f736d6f732e63727970746f2e736563703235366b312e5075624b657912230a21034f04181eeba35391b858633a765c4a0c189697b40d216354d50890d350c7029012040a02080112130a0d0a0575636f736d12043230303010c09a0c1a0c73696d642d74657374696e672001";
+    const SIGNATURE_HEX: &str = "c9dd20e07464d3a688ff4b710b1fbc027e495e797cfa0b4804da2ed117959227772de059808f765aa29b8f92edf30f4c2c5a438e30d3fe6897daa7141e3ce6f9";
+
+    let intent = CosmosIntent {
+        chain_id: "simd-testing".into(),
+        hrp: "cosmos".into(),
+        account_number: 1,
+        sequence: 0,
+        from_address: "cosmos1pkptre7fdkl6gfrzlesjjvhxhlc3r4gmmk8rs6".into(),
+        to_address: "cosmos1qypqxpq9qcrsszg2pvxq6rs0zqg3yyc5lzv7xu".into(),
+        amount: "1234567".into(),
+        denom: "ucosm".into(),
+        fee_amount: "2000".into(),
+        fee_denom: "ucosm".into(),
+        gas_limit: 200_000,
+        memo: "".into(),
+        pubkey_compressed_hex: PUBKEY_HEX.into(),
+    };
+    let unsigned = CosmosAdapter::build_unsigned(&intent).unwrap();
+    let digest = match &unsigned.sign_requests[0] {
+        SignRequest::Digest(d) => *d,
+        other => panic!("expected Digest, got {other:?}"),
+    };
+
+    // (a) our SignDoc bytes are byte-identical to cosmjs's signBytes.
+    let ref_sign_bytes = hex::decode(SIGN_BYTES_HEX).unwrap();
+    let ref_digest: [u8; 32] = Sha256::digest(&ref_sign_bytes).into();
+    assert_eq!(
+        digest, ref_digest,
+        "our SignDoc digest must equal sha256(cosmjs signBytes)"
+    );
+
+    // (b) cosmjs's signature verifies against OUR digest under the signer pubkey.
+    let pk = bitcoin::secp256k1::PublicKey::from_slice(&hex::decode(PUBKEY_HEX).unwrap()).unwrap();
+    let sig = bitcoin::secp256k1::ecdsa::Signature::from_compact(
+        &hex::decode(SIGNATURE_HEX).unwrap(),
+    )
+    .unwrap();
+    let msg = bitcoin::secp256k1::Message::from_digest(digest);
+    bitcoin::secp256k1::Secp256k1::verification_only()
+        .verify_ecdsa(&msg, &sig, &pk)
+        .expect("cosmjs signature must verify against our independently-computed digest");
 }

@@ -1,4 +1,4 @@
-//! Cosmos (cosmrs) chain adapter — external-signer mode.
+//! Cosmos (cosmrs) chain adapter — host-signed mode.
 //!
 //! cosmrs is used ONLY for proto encoding (Body / AuthInfo / SignDoc / TxRaw);
 //! the private key never enters this crate. `build_unsigned` produces a 32-byte
@@ -56,5 +56,15 @@ impl CosmosAdapter {
         sigs: &[crate::types::Secp256k1Signature],
     ) -> Result<crate::types::RawTx, crate::types::AdapterError> {
         tx::assemble_signed(unsigned, sigs)
+    }
+
+    /// Assemble a TxRaw for the simulate read-path ONLY (dummy signature, no
+    /// #15 self-verify). See [`tx::assemble_for_simulation`]. Never use on the
+    /// signing path.
+    pub fn assemble_for_simulation(
+        unsigned: &crate::types::Unsigned,
+        sigs: &[crate::types::Secp256k1Signature],
+    ) -> Result<crate::types::RawTx, crate::types::AdapterError> {
+        tx::assemble_for_simulation(unsigned, sigs)
     }
 }

@@ -1,4 +1,4 @@
-//! Cosmos SignDoc build + TxRaw assemble (SIGN_MODE_DIRECT, external-signer).
+//! Cosmos SignDoc build + TxRaw assemble (SIGN_MODE_DIRECT, host-signed).
 //!
 //! Pinned cosmrs 0.22 encoding API actually used here:
 //!   - `cosmrs::tx::Body::into_bytes(self) -> Result<Vec<u8>>`
@@ -28,6 +28,10 @@ use cosmrs::{AccountId, Coin};
 struct ResolvedCosmosTx {
     body_bytes: Vec<u8>,
     auth_info_bytes: Vec<u8>,
+    /// The signer's 33-byte compressed secp256k1 pubkey, hex. Carried so
+    /// `assemble_signed` can self-verify the signature against the SignDoc
+    /// sighash under it (#15) before emitting the TxRaw.
+    pubkey_compressed_hex: String,
 }
 
 fn parse_u128_decimal(s: &str, field: &str) -> Result<u128, AdapterError> {
@@ -105,6 +109,7 @@ pub fn build_unsigned(intent: &CosmosIntent) -> Result<Unsigned, AdapterError> {
     let resolved = ResolvedCosmosTx {
         body_bytes,
         auth_info_bytes,
+        pubkey_compressed_hex: intent.pubkey_compressed_hex.trim().to_string(),
     };
     let preimage = serde_json::to_vec(&resolved)
         .map_err(|e| AdapterError::Encoding(format!("serialize resolved cosmos tx: {e}")))?;
@@ -136,13 +141,67 @@ pub fn assemble_signed(
     sig64.extend_from_slice(&sig.r);
     sig64.extend_from_slice(&sig.s);
 
-    let txraw = cosmrs::proto::cosmos::tx::v1beta1::TxRaw {
-        body_bytes: resolved.body_bytes,
-        auth_info_bytes: resolved.auth_info_bytes,
-        signatures: vec![sig64],
+    // SELF-VERIFY (#15): the signature MUST validate against the SignDoc sighash
+    // (the digest emitted by build_unsigned) under the signer's pubkey before we
+    // emit the TxRaw. Reuses the same `bitcoin::secp256k1` verifier the BTC path
+    // uses. A wrong/corrupt signature is rejected here (fail loud) rather than
+    // broadcasting a TxRaw the chain silently rejects as an invalid signature.
+    let digest = match unsigned.sign_requests.first() {
+        Some(SignRequest::Digest(d)) => *d,
+        _ => return Err(AdapterError::Encoding("missing SignDoc sighash".into())),
     };
-    let bytes = txraw.encode_to_vec();
-    Ok(RawTx(bytes))
+    let pk_bytes = hex::decode(resolved.pubkey_compressed_hex.trim())
+        .map_err(|e| AdapterError::Encoding(format!("invalid stored pubkey hex: {e}")))?;
+    let pubkey = bitcoin::secp256k1::PublicKey::from_slice(&pk_bytes)
+        .map_err(|e| AdapterError::Encoding(format!("invalid stored pubkey: {e}")))?;
+    let mut secp_sig = bitcoin::secp256k1::ecdsa::Signature::from_compact(&sig64)
+        .map_err(|e| AdapterError::Encoding(format!("invalid compact sig: {e}")))?;
+    // Cosmos requires low-S; normalize before verify (the host signs low-S).
+    secp_sig.normalize_s();
+    let msg = bitcoin::secp256k1::Message::from_digest(digest);
+    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+    secp.verify_ecdsa(&msg, &secp_sig, &pubkey).map_err(|_| {
+        AdapterError::BadIntent("signature does not verify against the SignDoc sighash".into())
+    })?;
+
+    // Emit the LOW-S-normalized signature (Cosmos rejects high-S). The host
+    // already signs low-S, so this is a no-op in practice, but it keeps the
+    // emitted bytes consistent with the signature we verified.
+    encode_txraw(&resolved, secp_sig.serialize_compact().to_vec())
+}
+
+/// Assemble a TxRaw for the **simulate read-path ONLY**, splicing the signature
+/// bytes verbatim WITHOUT the #15 self-verify. The Cosmos `/simulate` endpoint
+/// is invoked with a dummy (all-zero) signature and the node runs it with
+/// signature verification disabled, so a real signature (and the real key) is
+/// never involved. NEVER use this on the signing/broadcast path — it does not
+/// verify the signature.
+pub fn assemble_for_simulation(
+    unsigned: &Unsigned,
+    sigs: &[Secp256k1Signature],
+) -> Result<RawTx, AdapterError> {
+    let resolved: ResolvedCosmosTx = serde_json::from_slice(&unsigned.preimage)
+        .map_err(|e| AdapterError::Encoding(format!("deserialize resolved cosmos tx: {e}")))?;
+    if sigs.len() != 1 {
+        return Err(AdapterError::BadIntent(format!(
+            "Cosmos requires exactly 1 signature, got {}",
+            sigs.len()
+        )));
+    }
+    let sig = &sigs[0];
+    let mut sig64 = Vec::with_capacity(64);
+    sig64.extend_from_slice(&sig.r);
+    sig64.extend_from_slice(&sig.s);
+    encode_txraw(&resolved, sig64)
+}
+
+fn encode_txraw(resolved: &ResolvedCosmosTx, signature: Vec<u8>) -> Result<RawTx, AdapterError> {
+    let txraw = cosmrs::proto::cosmos::tx::v1beta1::TxRaw {
+        body_bytes: resolved.body_bytes.clone(),
+        auth_info_bytes: resolved.auth_info_bytes.clone(),
+        signatures: vec![signature],
+    };
+    Ok(RawTx(txraw.encode_to_vec()))
 }
 
 #[cfg(test)]
@@ -220,6 +279,49 @@ mod tests {
         let sig = Secp256k1Signature { r: [0x11; 32], s: [0x22; 32], recovery_id: 0 };
         assert!(assemble_signed(&u, &[]).is_err());
         assert!(assemble_signed(&u, &[sig.clone(), sig.clone()]).is_err());
-        assert!(assemble_signed(&u, &[sig]).is_ok());
+        // A structurally-valid-but-wrong signature (correct count) is REJECTED by
+        // the post-assembly self-verify (#15) — see assemble_rejects_wrong_signature.
+    }
+
+    /// Sign the SignDoc sighash with the fixture's secp256k1 key (same 32-byte
+    /// seed as `test_pubkey_hex`, so the signature verifies against the embedded
+    /// pubkey). Uses the `bitcoin::secp256k1` signer (already a crate dep).
+    fn sign_cosmos(u: &Unsigned) -> Secp256k1Signature {
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let sk = bitcoin::secp256k1::SecretKey::from_slice(
+            &hex::decode("4646464646464646464646464646464646464646464646464646464646464646")
+                .unwrap(),
+        )
+        .unwrap();
+        let d = match &u.sign_requests[0] {
+            SignRequest::Digest(d) => *d,
+            other => panic!("expected Digest, got {other:?}"),
+        };
+        let msg = bitcoin::secp256k1::Message::from_digest(d);
+        let c = secp.sign_ecdsa(&msg, &sk).serialize_compact();
+        let mut r = [0u8; 32];
+        r.copy_from_slice(&c[0..32]);
+        let mut s = [0u8; 32];
+        s.copy_from_slice(&c[32..64]);
+        Secp256k1Signature { r, s, recovery_id: 0 }
+    }
+
+    #[test]
+    fn assemble_accepts_valid_signature() {
+        let u = build_unsigned(&fixture_intent()).unwrap();
+        assert!(
+            assemble_signed(&u, &[sign_cosmos(&u)]).is_ok(),
+            "a signature over the SignDoc sighash under the embedded pubkey assembles"
+        );
+    }
+
+    #[test]
+    fn assemble_rejects_wrong_signature() {
+        // #15: a structurally-valid signature that does NOT verify against the
+        // SignDoc sighash under the signer's pubkey is rejected (fail loud) rather
+        // than emitting a TxRaw the chain silently rejects at broadcast.
+        let u = build_unsigned(&fixture_intent()).unwrap();
+        let bad = Secp256k1Signature { r: [0x11; 32], s: [0x22; 32], recovery_id: 0 };
+        assert!(assemble_signed(&u, &[bad]).is_err());
     }
 }

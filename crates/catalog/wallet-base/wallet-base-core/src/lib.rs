@@ -24,5 +24,6 @@ pub mod solana;
 pub mod btc;
 pub mod subject;
 pub mod guardrails;
+pub mod nonce;
 
 pub use types::secp_sig_from_compact;

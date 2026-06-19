@@ -1,4 +1,4 @@
-//! Solana chain adapter — external-signer mode.
+//! Solana chain adapter — host-signed mode.
 //!
 //! Solana is the first non-secp256k1 chain in this crate: the signing curve is
 //! **Ed25519**, not secp256k1. Two consequences shape this adapter:
@@ -24,7 +24,7 @@ mod tx;
 pub use address::address_from_pubkey;
 pub use tx::SolanaIntent;
 
-/// Solana chain adapter (Ed25519; SystemProgram transfer, external-signer).
+/// Solana chain adapter (Ed25519; SystemProgram transfer, host-signed).
 pub struct SolanaAdapter;
 
 impl SolanaAdapter {
@@ -50,5 +50,15 @@ impl SolanaAdapter {
         sig64: &[u8],
     ) -> Result<crate::types::RawTx, crate::types::AdapterError> {
         tx::assemble_signed(unsigned, sig64)
+    }
+
+    /// Assemble a transaction for the simulate read-path ONLY (dummy signature,
+    /// no #15 self-verify). See [`tx::assemble_for_simulation`]. Never use on the
+    /// signing path.
+    pub fn assemble_for_simulation(
+        unsigned: &crate::types::Unsigned,
+        sig64: &[u8],
+    ) -> Result<crate::types::RawTx, crate::types::AdapterError> {
+        tx::assemble_for_simulation(unsigned, sig64)
     }
 }

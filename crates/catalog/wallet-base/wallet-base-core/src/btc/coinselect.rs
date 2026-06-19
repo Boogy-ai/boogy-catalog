@@ -90,17 +90,16 @@ pub fn select_coins(
             .saturating_add(DUST_THRESHOLD_SAT);
 
         if total >= need_with_change {
-            // Funds cover amount + fee + a non-dust change output.
+            // Funds cover amount + fee + a non-dust change output. The guard
+            // `need_with_change = target + fee_with_change + DUST` provably makes
+            // `change = total - target - fee_with_change >= DUST`, so no inner
+            // dust re-check is needed (#20 — the old fall-through was dead code).
             let change = total - target_sat - fee_with_change;
-            if change >= DUST_THRESHOLD_SAT {
-                return Ok(Selection {
-                    selected,
-                    change_sat: change,
-                    fee_sat: fee_with_change,
-                });
-            }
-            // Change came out dust after exact arithmetic — fall through to the
-            // single-output (no-change) path below, folding it into the fee.
+            return Ok(Selection {
+                selected,
+                change_sat: change,
+                fee_sat: fee_with_change,
+            });
         }
 
         // Fee assuming NO change output (1 output): recipient only.

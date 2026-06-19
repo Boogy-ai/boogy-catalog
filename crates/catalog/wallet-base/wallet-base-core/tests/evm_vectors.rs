@@ -33,6 +33,7 @@ fn eip155_legacy_intent() -> wallet_base_core::types::EvmIntent {
     use wallet_base_core::types::EvmIntent;
     EvmIntent {
         to: Some("0x3535353535353535353535353535353535353535".into()),
+        from_address: String::new(),
         value_wei: "1000000000000000000".into(),
         data_hex: "".into(),
         chain_id: 1,
@@ -101,6 +102,7 @@ fn eip1559_build_unsigned_is_typed() {
 
     let intent = EvmIntent {
         to: Some("0x3535353535353535353535353535353535353535".into()),
+        from_address: String::new(),
         value_wei: "1000".into(),
         data_hex: "".into(),
         chain_id: 1,
@@ -123,6 +125,37 @@ fn eip1559_build_unsigned_is_typed() {
 }
 
 #[test]
+fn eip1559_rejects_out_of_range_recovery_id() {
+    // #14: recovery_id ∉ {0,1} must be rejected, not silently collapsed to
+    // y_parity=false (which would recover a DIFFERENT address → a tx that can't
+    // land). The host signer effectively never emits 2/3, but fail closed anyway.
+    use wallet_base_core::evm::EvmAdapter;
+    use wallet_base_core::types::*;
+
+    let intent = EvmIntent {
+        to: Some("0x3535353535353535353535353535353535353535".into()),
+        from_address: String::new(),
+        value_wei: "1000".into(),
+        data_hex: "".into(),
+        chain_id: 1,
+        nonce: Some(5),
+        max_fee_per_gas: Some("30000000000".into()),
+        max_priority_fee_per_gas: Some("1000000000".into()),
+        gas_limit: Some(21000),
+        legacy: false,
+        gas_price: None,
+    };
+    let adapter = EvmAdapter;
+    let unsigned =
+        ChainAdapter::build_unsigned(&adapter, &intent, &ChainState::default()).unwrap();
+    let sig = Secp256k1Signature { r: [1; 32], s: [1; 32], recovery_id: 2 };
+    assert!(
+        ChainAdapter::assemble_signed(&adapter, &unsigned, &[sig]).is_err(),
+        "recovery_id outside {{0,1}} is rejected"
+    );
+}
+
+#[test]
 fn eip1559_roundtrip_decodes_to_same_fields() {
     use wallet_base_core::types::*;
     use wallet_base_core::evm::EvmAdapter;
@@ -131,6 +164,7 @@ fn eip1559_roundtrip_decodes_to_same_fields() {
 
     let intent = EvmIntent {
         to: Some("0x3535353535353535353535353535353535353535".into()),
+        from_address: String::new(),
         value_wei: "1000000000000000000".into(),
         data_hex: "0xabcdef".into(),
         chain_id: 1,
@@ -162,4 +196,63 @@ fn eip1559_roundtrip_decodes_to_same_fields() {
         }
         other => panic!("expected Eip1559 envelope, got {other:?}"),
     }
+}
+
+/// Canonical EIP-155 example r||s (recovery_id 0) for the 0x4646… key signing
+/// `eip155_legacy_intent()` — reused by the #15 self-verify tests below.
+fn eip155_example_sig() -> wallet_base_core::types::Secp256k1Signature {
+    use wallet_base_core::types::Secp256k1Signature;
+    let r: [u8; 32] =
+        hex::decode("28ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276")
+            .unwrap()
+            .try_into()
+            .unwrap();
+    let s: [u8; 32] =
+        hex::decode("67cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83")
+            .unwrap()
+            .try_into()
+            .unwrap();
+    Secp256k1Signature { r, s, recovery_id: 0 }
+}
+
+#[test]
+fn eip155_self_verify_accepts_correct_signer() {
+    use k256::ecdsa::SigningKey;
+    use wallet_base_core::evm::EvmAdapter;
+    use wallet_base_core::types::*;
+
+    // The 0x4646… key's address — the account the canonical signature recovers to.
+    let sk = SigningKey::from_slice(
+        &hex::decode("4646464646464646464646464646464646464646464646464646464646464646").unwrap(),
+    )
+    .unwrap();
+    let from = EvmAdapter
+        .derive_address(sk.verifying_key().to_encoded_point(false).as_bytes())
+        .unwrap();
+
+    let mut intent = eip155_legacy_intent();
+    intent.from_address = from;
+    let unsigned =
+        ChainAdapter::build_unsigned(&EvmAdapter, &intent, &ChainState::default()).unwrap();
+    assert!(
+        ChainAdapter::assemble_signed(&EvmAdapter, &unsigned, &[eip155_example_sig()]).is_ok(),
+        "#15: a signature that recovers to the wallet address assembles"
+    );
+}
+
+#[test]
+fn eip155_self_verify_rejects_wrong_signer() {
+    use wallet_base_core::evm::EvmAdapter;
+    use wallet_base_core::types::*;
+
+    // Same valid signature, but the host-set wallet address is a DIFFERENT
+    // account → the recovered signer mismatches → rejected before broadcast.
+    let mut intent = eip155_legacy_intent();
+    intent.from_address = "0x000000000000000000000000000000000000dEaD".into();
+    let unsigned =
+        ChainAdapter::build_unsigned(&EvmAdapter, &intent, &ChainState::default()).unwrap();
+    assert!(
+        ChainAdapter::assemble_signed(&EvmAdapter, &unsigned, &[eip155_example_sig()]).is_err(),
+        "#15: a signature recovering to a different account is rejected"
+    );
 }

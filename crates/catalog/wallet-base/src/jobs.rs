@@ -245,7 +245,24 @@ fn solana_broadcast(t: &mut Transaction, tx_id: u64, ctx: &JobContext) -> Result
     match solana_rpc::parse_send_result(&resp) {
         // The base58 signature IS the Solana tx hash.
         Ok(sig) => mark_submitted(t, tx_id, sig),
-        Err(e) => Err(broadcast_failure(t, tx_id, ctx, e.to_string())),
+        Err(e) => {
+            let msg = e.to_string();
+            // A blockhash-expiry rejection can NEVER succeed on retry — the
+            // blockhash is permanently outside the ~150-slot (~60-90s) window.
+            // Terminate immediately with a distinct `expired` status so the client
+            // re-issues /solana/send (fresh blockhash + re-sign), instead of
+            // burning the whole retry budget then reporting a misleading generic
+            // `failed` (#13). No funds move (an expired tx never executes).
+            let low = msg.to_lowercase();
+            if low.contains("blockhash not found") || low.contains("block height exceeded") {
+                t.status = "expired".to_string();
+                t.updated_at = Timestamp::new(now_millis() as i64);
+                let _ = db_update(tx_id, t);
+                publish_tx_status(t);
+                return Err(JobError::Terminal(format!("solana blockhash expired: {msg}")));
+            }
+            Err(broadcast_failure(t, tx_id, ctx, msg))
+        }
     }
 }
 

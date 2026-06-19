@@ -1,5 +1,5 @@
 //! Solana message build + transaction assemble (SystemProgram transfer,
-//! external-signer, Ed25519).
+//! host-signed, Ed25519).
 //!
 //! Pinned, spike-verified API used here:
 //!   - `solana_system_interface::instruction::transfer(&from, &to, lamports)
@@ -12,9 +12,14 @@
 //!      `tx.signatures[0] = Signature::from(<[u8; 64]>)` and
 //!      `bincode::serialize(&tx)` for the broadcast-ready wire bytes.
 //!
-//! The `Message` is round-tripped through `bincode` from `Unsigned.preimage`
-//! (which holds `message.serialize()` == the bincode/wincode wire form), so
-//! `assemble_signed` rebuilds the exact transaction without re-deriving it.
+//! The `Message` is round-tripped from `Unsigned.preimage`, which holds
+//! `message.serialize()`. In solana-message 4.x `Message::serialize()` is
+//! `wincode::serialize` while `assemble_signed` decodes with `bincode`; the
+//! round-trip is byte-correct because wincode's ShortU16 + fixint-LE layout is
+//! identical to what serde's `bincode` reads back here for this fixed Message
+//! shape (#19 — the two encoders agree on these bytes; do NOT assume they are
+//! interchangeable in general). `btc_vectors`-style snapshot + round-trip tests
+//! guard against a future divergence.
 
 use crate::types::*;
 
@@ -92,6 +97,43 @@ pub fn assemble_signed(unsigned: &Unsigned, sig64: &[u8]) -> Result<RawTx, Adapt
     let message: Message = bincode::deserialize(&unsigned.preimage)
         .map_err(|e| AdapterError::Encoding(format!("deserialize solana message: {e}")))?;
 
+    // SELF-VERIFY (#15): the Ed25519 signature MUST validate against the signed
+    // message bytes (the preimage) under the fee-payer / signer pubkey
+    // (`account_keys[0]` — the sole required signer for a single-signer transfer)
+    // before we emit the transaction. A wrong/corrupt signature is rejected here
+    // (fail loud) rather than broadcasting a tx the cluster rejects.
+    let signer = message
+        .account_keys
+        .first()
+        .ok_or_else(|| AdapterError::Encoding("message has no signer account".into()))?;
+    if !Signature::from(sig_arr).verify(signer.as_ref(), &unsigned.preimage) {
+        return Err(AdapterError::BadIntent(
+            "signature does not verify against the message".into(),
+        ));
+    }
+
+    splice_signature(message, sig_arr)
+}
+
+/// Assemble a transaction for the **simulate read-path ONLY**, splicing the
+/// signature verbatim WITHOUT the #15 self-verify. The Solana `simulateTransaction`
+/// RPC is invoked with `sigVerify: false` and a dummy (all-zero) signature, so a
+/// real signature (and the real key) is never involved. NEVER use this on the
+/// signing/broadcast path — it does not verify the signature.
+pub fn assemble_for_simulation(unsigned: &Unsigned, sig64: &[u8]) -> Result<RawTx, AdapterError> {
+    let sig_arr: [u8; 64] = sig64.try_into().map_err(|_| {
+        AdapterError::Encoding(format!(
+            "Solana requires a 64-byte Ed25519 signature, got {}",
+            sig64.len()
+        ))
+    })?;
+    let message: Message = bincode::deserialize(&unsigned.preimage)
+        .map_err(|e| AdapterError::Encoding(format!("deserialize solana message: {e}")))?;
+    splice_signature(message, sig_arr)
+}
+
+/// Splice a raw 64-byte signature into slot 0 of the transaction and serialize.
+fn splice_signature(message: Message, sig_arr: [u8; 64]) -> Result<RawTx, AdapterError> {
     // new_unsigned sizes `.signatures` to num_required_signatures (== 1 for a
     // single-signer transfer); splice the raw sig into slot 0.
     let mut tx = Transaction::new_unsigned(message);
@@ -146,7 +188,41 @@ mod tests {
                 "len {len} must Err"
             );
         }
-        assert!(SolanaAdapter::assemble_signed(&u, &[0xAB; 64]).is_ok());
+        // A 64-byte-but-wrong signature is now REJECTED by the post-assembly
+        // self-verify (#15) — see assemble_rejects_wrong_signature / accepts_valid.
+    }
+
+    /// A real Ed25519 keypair (test-only) + an intent whose `from` is its pubkey.
+    fn signing_fixture() -> (ed25519_dalek::SigningKey, SolanaIntent) {
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x11u8; 32]);
+        let pk = sk.verifying_key().to_bytes();
+        let intent = SolanaIntent {
+            from_pubkey_hex: hex::encode(pk),
+            ..fixture_intent()
+        };
+        (sk, intent)
+    }
+
+    #[test]
+    fn assemble_accepts_valid_signature() {
+        use ed25519_dalek::Signer;
+        let (sk, intent) = signing_fixture();
+        let u = build_unsigned(&intent).unwrap();
+        // Sign the exact message bytes (== preimage) the Ed25519 path commits to.
+        let sig = sk.sign(&u.preimage).to_bytes();
+        assert!(
+            SolanaAdapter::assemble_signed(&u, &sig).is_ok(),
+            "a signature over the message under the signer key assembles"
+        );
+    }
+
+    #[test]
+    fn assemble_rejects_wrong_signature() {
+        // #15: a 64-byte signature that does NOT verify against the message under
+        // the signer pubkey is rejected (fail loud), not spliced + broadcast.
+        let (_sk, intent) = signing_fixture();
+        let u = build_unsigned(&intent).unwrap();
+        assert!(SolanaAdapter::assemble_signed(&u, &[0xAB; 64]).is_err());
     }
 
     #[test]

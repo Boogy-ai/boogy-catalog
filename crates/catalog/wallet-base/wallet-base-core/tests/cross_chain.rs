@@ -53,6 +53,7 @@ fn test_compressed_pubkey() -> Vec<u8> {
 fn evm_intent() -> EvmIntent {
     EvmIntent {
         to: Some("0x000000000000000000000000000000000000dEaD".into()),
+        from_address: String::new(),
         value_wei: "1000000".into(),
         data_hex: "".into(),
         chain_id: 1,
@@ -222,7 +223,22 @@ fn assemble_signed_is_bound_to_its_own_chain_encoding() {
     // Cosmos: assembling the Cosmos `Unsigned` with a single sig yields a decodable
     // protobuf `TxRaw` (64-byte compact r||s, no recovery id).
     let cosmos_unsigned = CosmosAdapter::build_unsigned(&cosmos_intent()).unwrap();
-    let cosmos_sig = Secp256k1Signature { r: [0xAB; 32], s: [0xCD; 32], recovery_id: 0 };
+    // Real signature over the SignDoc sighash (the post-assembly self-verify, #15,
+    // rejects a dummy r||s). Same fixed test key as the pubkey in cosmos_intent().
+    let cosmos_digest = match &cosmos_unsigned.sign_requests[0] {
+        SignRequest::Digest(d) => *d,
+        other => panic!("expected Digest, got {other:?}"),
+    };
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let sk = bitcoin::secp256k1::SecretKey::from_slice(&hex::decode(TEST_SK_HEX).unwrap()).unwrap();
+    let mut signed = secp.sign_ecdsa(&bitcoin::secp256k1::Message::from_digest(cosmos_digest), &sk);
+    signed.normalize_s();
+    let compact = signed.serialize_compact();
+    let cosmos_sig = Secp256k1Signature {
+        r: compact[0..32].try_into().unwrap(),
+        s: compact[32..64].try_into().unwrap(),
+        recovery_id: 0,
+    };
     let cosmos_raw = CosmosAdapter::assemble_signed(&cosmos_unsigned, &[cosmos_sig]).unwrap();
     let txraw = TxRaw::decode(cosmos_raw.0.as_slice())
         .expect("Cosmos assemble_signed must produce a decodable protobuf TxRaw");

@@ -11,6 +11,7 @@ use wallet_base_core::types::*;
 fn base_intent() -> EvmIntent {
     EvmIntent {
         to: Some("0x3535353535353535353535353535353535353535".into()),
+        from_address: String::new(),
         value_wei: "1000".into(),
         data_hex: "".into(),
         chain_id: 1,

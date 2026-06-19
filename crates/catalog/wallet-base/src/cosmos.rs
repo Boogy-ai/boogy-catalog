@@ -1,4 +1,9 @@
-//! Cosmos (`/cosmos/*`) service handlers — external-signer mode.
+//! Cosmos (`/cosmos/*`) service handlers.
+//!
+//! **Trust model: CUSTODIAL.** The host holds the signing key (via the `signing`
+//! capability) and signs on the user's behalf; this wasm never holds private key
+//! material. "host-signed" means the key is external to the *wasm* — NOT that the
+//! end user signs. The threat surface is the full custodial one.
 //!
 //! Mirrors the EVM surface (`sign` / `simulate` / `fees` / `send` / `policy`)
 //! but over a Cosmos SDK chain via `wallet_base_core::cosmos::CosmosAdapter` and
@@ -30,9 +35,9 @@ use wallet_base_core::types::{Secp256k1Signature, SignRequest};
 use crate::models::{Transaction, Wallet};
 use crate::rpc_client::call_cosmos_rpc;
 use crate::{
-    auth, db_insert, is_blocked, jobs_enqueue, load_daily_spend, load_policy, now_millis,
-    parse_allowlist, put_policy_for, signing_sign_digest, tx, upsert_daily_spend, ApiError, Json,
-    PolicyReq, Query, Req, SendOut, SignOut, SimOut, COSMOS_CHAIN, COSMOS_HRP,
+    auth, db_insert, enforce_spend_policy, is_blocked, jobs_enqueue, load_policy, now_millis,
+    put_policy_for, record_external_sign, signing_sign_digest, tx, upsert_daily_spend, ApiError,
+    Json, PolicyReq, Query, Req, SendOut, SignOut, SimOut, Spend, COSMOS_CHAIN, COSMOS_HRP,
 };
 
 // ─── DTOs ──────────────────────────────────────────────────────────────────────
@@ -167,6 +172,12 @@ fn fetch_account(address: &str) -> Result<(u64, u64), ApiError> {
 pub fn cosmos_sign(Json(body): Json<CosmosIntentReq>) -> Result<Json<SignOut>, ApiError> {
     let p = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
 
+    // A blocked principal cannot sign (gate parity with /send — the returned raw
+    // tx is a complete, self-broadcastable spend of the custodial key).
+    if is_blocked(&p)? {
+        return Err(ApiError::forbidden("this account is blocked"));
+    }
+
     // Label is host-derived; this also validates "cosmos" as a known chain.
     let label = wallet_base_core::subject::wallet_label_checked(&p, COSMOS_CHAIN)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -184,9 +195,39 @@ pub fn cosmos_sign(Json(body): Json<CosmosIntentReq>) -> Result<Json<SignOut>, A
         .ok_or_else(|| ApiError::bad_request("gas_limit required for sign-only"))?;
 
     let intent = build_intent(&body, &wallet, account_number, sequence, gas_limit);
+
+    // ── Guardrails BEFORE the key is touched (#1) — block-list + spend policy +
+    // fee bound, same as /cosmos/send, plus a mandatory daily-spend debit. ──
+    enforce_spend_policy(
+        &p,
+        COSMOS_CHAIN,
+        &Spend {
+            value: intent.amount.clone(),
+            fee: intent.fee_amount.clone(),
+            denom: intent.denom.clone(),
+            recipient: intent.to_address.clone(),
+            sim_success: true,
+        },
+    )?;
+
     let unsigned = CosmosAdapter::build_unsigned(&intent)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let raw = sign_and_assemble(&label, &unsigned)?;
+
+    // Record the signed tx + debit daily-spend (no broadcast job).
+    let intent_json = serde_json::to_string(&serialize_intent(&intent))
+        .map_err(|e| ApiError::internal(format!("encode intent: {e}")))?;
+    record_external_sign(
+        &p,
+        COSMOS_CHAIN,
+        &intent.denom,
+        &intent.to_address,
+        &intent.amount,
+        sequence as i64,
+        &intent.fee_amount,
+        &raw,
+        &intent_json,
+    )?;
 
     Ok(Json(SignOut { raw }))
 }
@@ -215,9 +256,10 @@ pub fn do_cosmos_simulate(principal: &str, body: CosmosIntentReq) -> Result<SimO
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     // DUMMY signature: simulate does not verify it, so the real key is NOT
-    // touched on this read path.
+    // touched on this read path. Use the no-verify simulation assemble — the #15
+    // self-verify on `assemble_signed` would (correctly) reject this dummy sig.
     let dummy = Secp256k1Signature { r: [0u8; 32], s: [0u8; 32], recovery_id: 0 };
-    let raw = CosmosAdapter::assemble_signed(&unsigned, &[dummy])
+    let raw = CosmosAdapter::assemble_for_simulation(&unsigned, &[dummy])
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let resp = call_cosmos_rpc(&simulate_request(&raw.0))?;
@@ -297,42 +339,24 @@ pub fn do_cosmos_send(principal: &str, body: CosmosIntentReq) -> Result<SendOut,
 
     let intent = build_intent(&body, &wallet, account_number, sequence, gas_limit);
 
-    // ── Guardrails — BEFORE signing ──
-    // value = the MsgSend amount in base denom; recipient = the bech32 to_address
-    // (canonical lowercase already — do NOT re-case it). Cosmos send carries no
-    // calldata, so to_is_contract = false and the contract allowlist is empty. We
-    // do not simulate on the send path beyond an optional gas estimate, so
-    // sim_success = true (no revert signal to enforce).
-    let policy = load_policy(principal, COSMOS_CHAIN)?;
+    // ── Guardrails — BEFORE signing (single enforcement point) ──
+    // value = the MsgSend amount in base denom; fee = the explicit `fee_amount`
+    // (bounded by the fee cap + counted toward the daily cap — #2); recipient =
+    // the bech32 to_address (canonical lowercase already — do NOT re-case it).
+    // Cosmos send carries no calldata, so to_is_contract = false. We do not
+    // simulate beyond an optional gas estimate, so sim_success = true.
     let now_secs = now_millis() as i64 / 1000;
-    let daily = load_daily_spend(principal, COSMOS_CHAIN, now_secs)?;
-
-    let (max_value_wei, daily_cap_wei, recipient_allow, _contract_allow, refuse_on_revert) =
-        match &policy {
-            Some(pol) => (
-                pol.max_value_wei.clone(),
-                pol.daily_cap_wei.clone(),
-                parse_allowlist(&pol.recipient_allowlist),
-                parse_allowlist(&pol.contract_allowlist),
-                pol.refuse_on_revert,
-            ),
-            None => (String::new(), String::new(), Vec::new(), Vec::new(), true),
-        };
-
-    let pi = wallet_base_core::guardrails::PolicyInput {
-        value_wei: intent.amount.clone(),
-        max_value_wei,
-        daily_cap_wei,
-        daily_spent_wei: daily.as_ref().map(|d| d.spent_wei.clone()).unwrap_or_default(),
-        recipient: intent.to_address.clone(),
-        recipient_allowlist: recipient_allow,
-        to_is_contract: false,
-        contract_allowlist: Vec::new(),
-        sim_success: true,
-        refuse_on_revert,
-    };
-    wallet_base_core::guardrails::check_policy(&pi)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    enforce_spend_policy(
+        principal,
+        COSMOS_CHAIN,
+        &Spend {
+            value: intent.amount.clone(),
+            fee: intent.fee_amount.clone(),
+            denom: intent.denom.clone(),
+            recipient: intent.to_address.clone(),
+            sim_success: true,
+        },
+    )?;
 
     // ── Sign (key is touched only after guardrails pass) ──
     let unsigned = CosmosAdapter::build_unsigned(&intent)
@@ -344,6 +368,7 @@ pub fn do_cosmos_send(principal: &str, body: CosmosIntentReq) -> Result<SendOut,
         .map_err(|e| ApiError::internal(format!("encode intent: {e}")))?;
     let to_addr = intent.to_address.clone();
     let value_wei = intent.amount.clone();
+    let denom = intent.denom.clone();
     let nonce_i64 = sequence as i64; // reuse the nonce column for the cosmos sequence
     let fee_wei = intent.fee_amount.clone();
     let now = Timestamp::new(now_millis() as i64);
@@ -370,7 +395,7 @@ pub fn do_cosmos_send(principal: &str, body: CosmosIntentReq) -> Result<SendOut,
         })
         .map_err(ApiError::from)?;
 
-        upsert_daily_spend(&owner, COSMOS_CHAIN, now_secs, &value_wei, now)?;
+        upsert_daily_spend(&owner, COSMOS_CHAIN, &denom, now_secs, &value_wei, &fee_wei, now)?;
 
         jobs_enqueue(JobSpec {
             handler: "broadcast_tx".into(),

@@ -15,6 +15,10 @@ struct ResolvedTx {
     chain_id: u64,
     nonce: u64,
     to: Option<String>, // 0x-hex; None = create
+    /// Signer's 0x address (host-derived), for the #15 recover-and-compare.
+    /// Empty = skip (lower-level encoding paths).
+    #[serde(default)]
+    from_address: String,
     value_wei: String,  // decimal
     input_hex: String,  // hex w/o 0x
     legacy: bool,
@@ -139,6 +143,7 @@ pub fn build_unsigned(intent: &EvmIntent, state: &ChainState) -> Result<Unsigned
         chain_id: intent.chain_id,
         nonce,
         to: intent.to.clone(),
+        from_address: intent.from_address.clone(),
         value_wei: intent.value_wei.clone(),
         input_hex,
         legacy: intent.legacy,
@@ -177,10 +182,47 @@ pub fn assemble_signed(
         )));
     }
     let sig = &sigs[0];
+    // The recovery id MUST be 0 or 1 (#14). A stray 2/3 (or anything else) would
+    // otherwise collapse to y_parity=false and recover a DIFFERENT address — a tx
+    // that fails to land. Fail closed.
+    if sig.recovery_id != 0 && sig.recovery_id != 1 {
+        return Err(AdapterError::BadIntent(format!(
+            "EVM signature recovery_id must be 0 or 1, got {}",
+            sig.recovery_id
+        )));
+    }
     let r = U256::from_be_slice(&sig.r);
     let s = U256::from_be_slice(&sig.s);
     let y_parity = sig.recovery_id == 1;
     let signature = Signature::new(r, s, y_parity);
+
+    // SELF-VERIFY (#15): recover the signer from the sighash + (r, s, recovery_id)
+    // and confirm it matches the host-set wallet address. This catches a wrong
+    // recovery bit or corrupted r/s that the recovery_id range check (#14) alone
+    // cannot — fail loud rather than broadcast a tx that recovers to a DIFFERENT
+    // account. Skipped only when `from_address` is empty (lower-level encoding
+    // paths / fixtures); the production send path always sets it.
+    if !resolved.from_address.trim().is_empty() {
+        let digest = match unsigned.sign_requests.first() {
+            Some(SignRequest::Digest(d)) => *d,
+            _ => return Err(AdapterError::Encoding("missing EVM sighash".into())),
+        };
+        let rid = k256::ecdsa::RecoveryId::from_byte(sig.recovery_id)
+            .ok_or_else(|| AdapterError::BadIntent("invalid EVM recovery id".into()))?;
+        let mut compact = [0u8; 64];
+        compact[0..32].copy_from_slice(&sig.r);
+        compact[32..64].copy_from_slice(&sig.s);
+        let ksig = k256::ecdsa::Signature::from_slice(&compact)
+            .map_err(|e| AdapterError::BadIntent(format!("invalid signature scalars: {e}")))?;
+        let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(&digest, &ksig, rid)
+            .map_err(|_| AdapterError::BadIntent("signature does not recover a key".into()))?;
+        let recovered = super::address::address_from_pubkey(vk.to_encoded_point(false).as_bytes())?;
+        if !recovered.eq_ignore_ascii_case(resolved.from_address.trim()) {
+            return Err(AdapterError::BadIntent(
+                "recovered signer does not match the wallet address".into(),
+            ));
+        }
+    }
 
     let bytes = if resolved.legacy {
         let tx = legacy_tx(&resolved)?;

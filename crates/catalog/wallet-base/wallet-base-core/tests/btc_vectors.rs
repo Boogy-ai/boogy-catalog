@@ -3,7 +3,7 @@
 //! private key, no local signing — sighashes go out, signatures come back in.
 
 use wallet_base_core::btc::{BtcAdapter, BtcIntent, BtcNetwork, Utxo};
-use wallet_base_core::types::{RawTx, Secp256k1Signature, SignRequest};
+use wallet_base_core::types::{RawTx, Secp256k1Signature, SignRequest, Unsigned};
 
 // ---------------------------------------------------------------------------
 // Task 1 — P2WPKH address KAT + adversarial
@@ -104,11 +104,48 @@ fn valid_dummy_sig() -> Secp256k1Signature {
     Secp256k1Signature { r, s, recovery_id: 0 }
 }
 
+/// Deterministic test private key. assemble_signed now self-verifies each
+/// signature against its BIP143 sighash (#7), so round-trip tests must produce
+/// REAL signatures from a key whose pubkey is the intent's `from_pubkey_hex`.
+fn test_sk() -> bitcoin::secp256k1::SecretKey {
+    bitcoin::secp256k1::SecretKey::from_slice(&[0x42u8; 32]).unwrap()
+}
+
+/// The compressed-pubkey hex for [`test_sk`] — use as `from_pubkey_hex`.
+fn test_pubkey_hex() -> String {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &test_sk());
+    hex::encode(pk.serialize())
+}
+
+/// Sign every per-input sighash of `u` with [`test_sk`] — real, low-S sigs.
+fn sign_all(u: &Unsigned) -> Vec<Secp256k1Signature> {
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let sk = test_sk();
+    u.sign_requests
+        .iter()
+        .map(|sr| {
+            let d = match sr {
+                SignRequest::Digest(d) => *d,
+                other => panic!("expected Digest, got {other:?}"),
+            };
+            let msg = bitcoin::secp256k1::Message::from_digest(d);
+            let c = secp.sign_ecdsa(&msg, &sk).serialize_compact();
+            let mut r = [0u8; 32];
+            r.copy_from_slice(&c[0..32]);
+            let mut s = [0u8; 32];
+            s.copy_from_slice(&c[32..64]);
+            Secp256k1Signature { r, s, recovery_id: 0 }
+        })
+        .collect()
+}
+
 #[test]
 fn btc_single_input_roundtrips() {
-    let u = BtcAdapter::build_unsigned(&fixture_intent()).unwrap();
+    let intent = BtcIntent { from_pubkey_hex: test_pubkey_hex(), ..fixture_intent() };
+    let u = BtcAdapter::build_unsigned(&intent).unwrap();
     assert_eq!(u.sign_requests.len(), 1);
-    let raw: RawTx = BtcAdapter::assemble_signed(&u, &[valid_dummy_sig()]).unwrap();
+    let raw: RawTx = BtcAdapter::assemble_signed(&u, &sign_all(&u)).unwrap();
 
     let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw.0).unwrap();
     assert_eq!(tx.input.len(), 1, "one input survives");
@@ -123,7 +160,7 @@ fn btc_single_input_roundtrips() {
 fn btc_multi_input_roundtrips() {
     // Two UTXOs of 40_000 each (80_000 total); send 50_000 → both inputs needed.
     let intent = BtcIntent {
-        from_pubkey_hex: PUBKEY_HEX.into(),
+        from_pubkey_hex: test_pubkey_hex(),
         network: BtcNetwork::Mainnet,
         to_address: ADDR_MAINNET.into(),
         amount_sat: 50_000,
@@ -141,7 +178,7 @@ fn btc_multi_input_roundtrips() {
         panic!("expected two Digest sign_requests");
     }
 
-    let sigs = vec![valid_dummy_sig(), valid_dummy_sig()];
+    let sigs = sign_all(&u);
     let raw = BtcAdapter::assemble_signed(&u, &sigs).unwrap();
 
     let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw.0).unwrap();
@@ -155,7 +192,7 @@ fn btc_multi_input_roundtrips() {
 fn btc_coinselect_picks_enough_and_computes_change() {
     // Send 10_000 from a 100_000 UTXO → 1 input, non-dust change → 2 outputs.
     let intent = BtcIntent {
-        from_pubkey_hex: PUBKEY_HEX.into(),
+        from_pubkey_hex: test_pubkey_hex(),
         network: BtcNetwork::Mainnet,
         to_address: ADDR_MAINNET.into(),
         amount_sat: 10_000,
@@ -163,7 +200,7 @@ fn btc_coinselect_picks_enough_and_computes_change() {
         utxos: vec![utxo(0x01, 100_000)],
     };
     let u = BtcAdapter::build_unsigned(&intent).unwrap();
-    let raw = BtcAdapter::assemble_signed(&u, &[valid_dummy_sig()]).unwrap();
+    let raw = BtcAdapter::assemble_signed(&u, &sign_all(&u)).unwrap();
     let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw.0).unwrap();
     assert_eq!(tx.output.len(), 2, "recipient + non-dust change");
     // Recipient output value is exactly the requested amount.
@@ -178,7 +215,7 @@ fn btc_dust_change_folded_into_fee_no_change_output() {
     // 1 input, 1 output vsize = 11 + 68 + 31 = 110; fee@1 = 110.
     // total = 10_000 + 110 + 293 (dust-1) = 10_403.
     let intent = BtcIntent {
-        from_pubkey_hex: PUBKEY_HEX.into(),
+        from_pubkey_hex: test_pubkey_hex(),
         network: BtcNetwork::Mainnet,
         to_address: ADDR_MAINNET.into(),
         amount_sat: 10_000,
@@ -186,7 +223,7 @@ fn btc_dust_change_folded_into_fee_no_change_output() {
         utxos: vec![utxo(0x01, 10_403)],
     };
     let u = BtcAdapter::build_unsigned(&intent).unwrap();
-    let raw = BtcAdapter::assemble_signed(&u, &[valid_dummy_sig()]).unwrap();
+    let raw = BtcAdapter::assemble_signed(&u, &sign_all(&u)).unwrap();
     let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw.0).unwrap();
     assert_eq!(tx.output.len(), 1, "dust change folded into fee → no change output");
     assert_eq!(tx.output[0].value.to_sat(), 10_000, "recipient only");
@@ -256,23 +293,15 @@ fn btc_garbage_to_address_errs() {
 }
 
 #[test]
-fn btc_zero_amount_handling() {
-    // Zero-amount send: a 0-sat recipient output is below dust and economically
-    // meaningless, but coin selection still resolves (fee-only). We define the
-    // behavior as: it builds (no panic) — the recipient output carries 0 sat.
-    // Higher layers (guardrails) reject zero-value sends; the adapter is
-    // mechanical. Assert it does not panic and produces a well-formed tx.
-    let intent = BtcIntent {
-        from_pubkey_hex: PUBKEY_HEX.into(),
-        network: BtcNetwork::Mainnet,
-        to_address: ADDR_MAINNET.into(),
-        amount_sat: 0,
-        fee_rate_sat_vb: 1,
-        utxos: vec![utxo(0x01, 100_000)],
-    };
-    let u = BtcAdapter::build_unsigned(&intent).expect("zero-amount builds mechanically");
-    assert_eq!(u.sign_requests.len(), 1);
-    let raw = BtcAdapter::assemble_signed(&u, &[valid_dummy_sig()]).unwrap();
-    let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw.0).unwrap();
-    assert_eq!(tx.output[0].value.to_sat(), 0, "zero-sat recipient output");
+fn btc_zero_and_dust_amount_rejected() {
+    // #11: a zero / sub-dust recipient amount is rejected at build time, BEFORE
+    // the key is touched — it would only ever produce an unbroadcastable
+    // (non-standard dust) tx while consuming a daily-spend slot.
+    let zero = BtcIntent { amount_sat: 0, ..fixture_intent() };
+    assert!(BtcAdapter::build_unsigned(&zero).is_err(), "zero amount rejected");
+    let dust = BtcIntent { amount_sat: 293, ..fixture_intent() };
+    assert!(BtcAdapter::build_unsigned(&dust).is_err(), "sub-dust amount rejected");
+    // At the dust threshold (294) it builds.
+    let ok = BtcIntent { amount_sat: 294, ..fixture_intent() };
+    assert!(BtcAdapter::build_unsigned(&ok).is_ok(), "at-dust-threshold amount builds");
 }

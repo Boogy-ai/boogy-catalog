@@ -1,4 +1,4 @@
-//! Bitcoin chain adapter — P2WPKH (native SegWit), external-signer mode.
+//! Bitcoin chain adapter — P2WPKH (native SegWit), host-signed mode.
 //!
 //! Bitcoin is the first UTXO chain in this crate, which shapes the adapter
 //! differently from the account-based chains (EVM/Cosmos/Solana):
@@ -65,7 +65,7 @@ impl BtcNetwork {
 }
 
 /// Bitcoin chain adapter (P2WPKH native SegWit; single-recipient transfer with
-/// implicit change, external-signer).
+/// implicit change, host-signed).
 pub struct BtcAdapter;
 
 impl BtcAdapter {

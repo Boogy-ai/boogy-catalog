@@ -38,9 +38,19 @@ solana-instruction = "3"
 solana-message = { version = "4", default-features = false, features = ["wincode", "serde"] }
 solana-transaction = { version = "4", default-features = false, features = ["serde"] }
 solana-system-interface = { version = "3", default-features = false, features = ["bincode"] }
-solana-signature = "3"
+# `verify` enables host-mediated-signature self-verification (#15): we check the
+# returned Ed25519 sig against the signed message before emitting the tx. This
+# pulls a verify-only ed25519-dalek (no local key generation / no getrandom), so
+# the external-signer rule above still holds.
+solana-signature = { version = "3", features = ["verify"] }
 # Bitcoin tx-building types (Address / Transaction / SighashCache) + secp256k1
 # (transitively pinned to 0.29.1). External-signer ONLY: we never gen/sign keys,
 # so `rand` / `global-context` / `secp-recovery` / `serde` stay OFF. P2WPKH is
 # UTXO-based — N inputs → N BIP143 sighashes → N secp256k1 signatures.
 bitcoin = { version = "=0.32.10", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+# TEST-ONLY Ed25519 signer, used to produce real signatures for the Solana
+# post-assembly self-verify tests (#15). Dev-only: never compiled into the
+# wasm32-wasip2 lib, so the external-signer / no-local-signing rule above holds.
+ed25519-dalek = "2"

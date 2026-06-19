@@ -30,11 +30,25 @@ use crate::{EVM_CHAIN, PolicyReq};
 
 /// Operator gate: admit ONLY the service owner's agent (host-attested).
 ///
-/// DELIBERATELY does not admit owner-workloads: `/admin` is a cross-user surface
-/// (lists every principal's wallets, can tighten any principal's policy), so only
-/// the owner's own agent is permitted. If backend-workload `/admin` access is ever
-/// needed, add an explicit allowlist — do NOT widen to all owner-workloads.
+/// `/admin` is a cross-principal surface (lists every principal's wallets, can
+/// tighten/loosen any principal's policy, block anyone), so it is AGENT-ONLY.
+///
+/// `caller_is_service_owner()` is NOT sufficient on its own: it returns `true`
+/// for ANY workload whose owner segment equals this deployment's owner — i.e.
+/// every OTHER service the same owner deployed. So we first reject any attested
+/// workload caller (principal OR OBO actor parses as a `boogy://…/services/…`
+/// URI) — even one of the owner's own apps — then require the owner's agent.
+/// This mirrors stripe-base's `audience()` (which admits owner-workloads as
+/// client apps; a fund-holding admin surface must not). Closes review #5.
 pub fn require_owner() -> Result<(), ApiError> {
+    let identity = crate::bindings::boogy::platform::auth::current_identity();
+    let principal = identity.as_ref().map(|i| i.principal.as_str()).unwrap_or("");
+    let actor = identity.as_ref().and_then(|i| i.actor.as_deref());
+    if wallet_base_core::subject::workload_owner_service(principal, actor).is_some() {
+        // An attested workload (even a sibling owner-workload) is never an operator.
+        return Err(ApiError::forbidden("operator (service owner) access required"));
+    }
+    // No attested workload → an agent. Only the service owner's agent qualifies.
     if crate::caller_is_service_owner() {
         Ok(())
     } else {
@@ -180,6 +194,7 @@ pub fn admin_put_policy(req: &mut Req<'_>) -> Result<Json<PolicyReq>, ApiError> 
     match existing {
         Some(mut e) => {
             e.max_value_wei = pol.max_value_wei.clone();
+            e.max_fee_wei = pol.max_fee_wei.clone();
             e.daily_cap_wei = pol.daily_cap_wei.clone();
             e.recipient_allowlist = recipient_allowlist;
             e.contract_allowlist = contract_allowlist;
@@ -193,6 +208,7 @@ pub fn admin_put_policy(req: &mut Req<'_>) -> Result<Json<PolicyReq>, ApiError> 
                 owner_principal: principal.clone(),
                 chain: EVM_CHAIN.to_string(),
                 max_value_wei: pol.max_value_wei.clone(),
+                max_fee_wei: pol.max_fee_wei.clone(),
                 daily_cap_wei: pol.daily_cap_wei.clone(),
                 recipient_allowlist,
                 contract_allowlist,

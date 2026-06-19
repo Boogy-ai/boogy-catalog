@@ -1,4 +1,9 @@
-//! Solana (`/solana/*`) service handlers — external-signer mode.
+//! Solana (`/solana/*`) service handlers.
+//!
+//! **Trust model: CUSTODIAL.** The host holds the signing key (via the `signing`
+//! capability) and signs on the user's behalf; this wasm never holds private key
+//! material. "host-signed" means the key is external to the *wasm* — NOT that the
+//! end user signs. The threat surface is the full custodial one.
 //!
 //! Mirrors the EVM/Cosmos surface (`sign` / `simulate` / `fees` / `send` /
 //! `policy`) but over Solana via `wallet_base_core::solana::SolanaAdapter` and
@@ -31,9 +36,9 @@ use wallet_base_core::types::SignRequest;
 use crate::models::{Transaction, Wallet};
 use crate::rpc_client::call_solana_rpc;
 use crate::{
-    auth, db_insert, is_blocked, jobs_enqueue, load_daily_spend, load_policy, now_millis,
-    parse_allowlist, put_policy_for, signing_sign_message, tx, upsert_daily_spend, ApiError, Json,
-    PolicyReq, Query, Req, SendOut, SignOut, SimOut, SOLANA_CHAIN,
+    auth, db_insert, enforce_spend_policy, is_blocked, jobs_enqueue, load_policy, now_millis,
+    put_policy_for, record_external_sign, signing_sign_message, tx, upsert_daily_spend, ApiError,
+    Json, PolicyReq, Query, Req, SendOut, SignOut, SimOut, Spend, SOLANA_CHAIN,
 };
 
 // ─── DTOs ──────────────────────────────────────────────────────────────────────
@@ -136,6 +141,12 @@ fn fetch_recent_blockhash() -> Result<String, ApiError> {
 pub fn solana_sign(Json(body): Json<SolanaIntentReq>) -> Result<Json<SignOut>, ApiError> {
     let p = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
 
+    // A blocked principal cannot sign (gate parity with /send — the returned raw
+    // tx is a complete, self-broadcastable spend of the custodial key).
+    if is_blocked(&p)? {
+        return Err(ApiError::forbidden("this account is blocked"));
+    }
+
     // Label is host-derived; this also validates "solana" as a known chain.
     let label = wallet_base_core::subject::wallet_label_checked(&p, SOLANA_CHAIN)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -148,9 +159,40 @@ pub fn solana_sign(Json(body): Json<SolanaIntentReq>) -> Result<Json<SignOut>, A
         .ok_or_else(|| ApiError::bad_request("recent_blockhash required for sign-only"))?;
 
     let intent = build_intent(&body, &wallet, recent_blockhash);
+
+    // ── Guardrails BEFORE the key is touched (#1) — block-list + spend policy,
+    // plus a mandatory daily-spend debit. Solana fee is network-set (fee = ""). ──
+    let value_lamports = intent.lamports.to_string();
+    enforce_spend_policy(
+        &p,
+        SOLANA_CHAIN,
+        &Spend {
+            value: value_lamports.clone(),
+            fee: String::new(),
+            denom: "lamport".to_string(),
+            recipient: intent.to_address.clone(),
+            sim_success: true,
+        },
+    )?;
+
     let unsigned = SolanaAdapter::build_unsigned(&intent)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let raw = sign_and_assemble(&label, &unsigned)?;
+
+    // Record the signed tx + debit daily-spend (no broadcast job).
+    let intent_json = serde_json::to_string(&serialize_intent(&intent))
+        .map_err(|e| ApiError::internal(format!("encode intent: {e}")))?;
+    record_external_sign(
+        &p,
+        SOLANA_CHAIN,
+        "lamport",
+        &intent.to_address,
+        &value_lamports,
+        0,
+        "",
+        &raw,
+        &intent_json,
+    )?;
 
     Ok(Json(SignOut { raw }))
 }
@@ -177,8 +219,9 @@ pub fn do_solana_simulate(principal: &str, body: SolanaIntentReq) -> Result<SimO
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     // DUMMY signature: simulate sets sigVerify:false, so the real key is NOT
-    // touched on this read path.
-    let raw = SolanaAdapter::assemble_signed(&unsigned, &[0u8; 64])
+    // touched on this read path. Use the no-verify simulation assemble — the #15
+    // self-verify on `assemble_signed` would (correctly) reject this dummy sig.
+    let raw = SolanaAdapter::assemble_for_simulation(&unsigned, &[0u8; 64])
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
     let resp = call_solana_rpc(&simulate_request(&raw.0))?;
@@ -263,43 +306,26 @@ pub fn do_solana_send(principal: &str, body: SolanaIntentReq) -> Result<SendOut,
 
     let intent = build_intent(&body, &wallet, recent_blockhash);
 
-    // ── Guardrails — BEFORE signing ──
+    // ── Guardrails — BEFORE signing (single enforcement point) ──
     // value = the transfer amount in lamports; recipient = the base58 to_address
     // (canonical — do NOT lowercase it; base58 is case-sensitive). A SystemProgram
-    // transfer carries no contract calldata, so to_is_contract = false and the
-    // contract allowlist is empty. We do not simulate on the send path, so
-    // sim_success = true (no revert signal to enforce).
-    let policy = load_policy(principal, SOLANA_CHAIN)?;
+    // transfer carries no contract calldata, so to_is_contract = false. We do not
+    // simulate on the send path, so sim_success = true. The Solana fee is
+    // network-set (per-signature, not caller-controlled) and not resolved here, so
+    // `fee = ""` (0) — the #2 fund-drain vector does not apply to Solana.
     let now_secs = now_millis() as i64 / 1000;
-    let daily = load_daily_spend(principal, SOLANA_CHAIN, now_secs)?;
-
-    let (max_value_wei, daily_cap_wei, recipient_allow, _contract_allow, refuse_on_revert) =
-        match &policy {
-            Some(pol) => (
-                pol.max_value_wei.clone(),
-                pol.daily_cap_wei.clone(),
-                parse_allowlist(&pol.recipient_allowlist),
-                parse_allowlist(&pol.contract_allowlist),
-                pol.refuse_on_revert,
-            ),
-            None => (String::new(), String::new(), Vec::new(), Vec::new(), true),
-        };
-
     let value_lamports = intent.lamports.to_string();
-    let pi = wallet_base_core::guardrails::PolicyInput {
-        value_wei: value_lamports.clone(),
-        max_value_wei,
-        daily_cap_wei,
-        daily_spent_wei: daily.as_ref().map(|d| d.spent_wei.clone()).unwrap_or_default(),
-        recipient: intent.to_address.clone(),
-        recipient_allowlist: recipient_allow,
-        to_is_contract: false,
-        contract_allowlist: Vec::new(),
-        sim_success: true,
-        refuse_on_revert,
-    };
-    wallet_base_core::guardrails::check_policy(&pi)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    enforce_spend_policy(
+        principal,
+        SOLANA_CHAIN,
+        &Spend {
+            value: value_lamports.clone(),
+            fee: String::new(),
+            denom: "lamport".to_string(),
+            recipient: intent.to_address.clone(),
+            sim_success: true,
+        },
+    )?;
 
     // ── Sign (key is touched only after guardrails pass) ──
     let unsigned = SolanaAdapter::build_unsigned(&intent)
@@ -337,7 +363,7 @@ pub fn do_solana_send(principal: &str, body: SolanaIntentReq) -> Result<SendOut,
         })
         .map_err(ApiError::from)?;
 
-        upsert_daily_spend(&owner, SOLANA_CHAIN, now_secs, &value_lamports, now)?;
+        upsert_daily_spend(&owner, SOLANA_CHAIN, "lamport", now_secs, &value_lamports, "", now)?;
 
         jobs_enqueue(JobSpec {
             handler: "broadcast_tx".into(),

@@ -40,7 +40,9 @@ mod mcp;
 mod models;
 mod rpc_client;
 mod solana;
-use models::{AdminAudit, BlockedPrincipal, DailySpend, Transaction, Wallet, WalletPolicy};
+use models::{
+    AdminAudit, BlockedPrincipal, DailySpend, NonceReservation, Transaction, Wallet, WalletPolicy,
+};
 use rpc_client::call_evm_rpc;
 
 use boogy_sdk::jobs::JobSpec;
@@ -64,6 +66,7 @@ impl Api for WalletBase {
         create_model::<DailySpend>();
         create_model::<BlockedPrincipal>();
         create_model::<AdminAudit>();
+        create_model::<NonceReservation>();
     }
 
     fn build_router() -> Router {
@@ -444,6 +447,9 @@ impl From<EvmIntentReq> for EvmIntent {
     fn from(r: EvmIntentReq) -> Self {
         EvmIntent {
             to: r.to,
+            // The signer is NEVER taken from the request body — do_send sets it
+            // host-side from the wallet row (the #15 self-verify anchor).
+            from_address: String::new(),
             value_wei: r.value_wei,
             data_hex: r.data_hex,
             chain_id: r.chain_id,
@@ -597,22 +603,59 @@ fn get_wallet(req: &mut Req<'_>) -> Result<Json<WalletOut>, ApiError> {
 fn evm_sign(Json(body): Json<EvmIntentReq>) -> Result<Json<SignOut>, ApiError> {
     let p = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
 
+    // A blocked principal cannot sign (gate parity with /send — the returned raw
+    // tx is a complete, self-broadcastable spend of the custodial key).
+    if is_blocked(&p)? {
+        return Err(ApiError::forbidden("this account is blocked"));
+    }
+
     // Label is host-derived; this also re-validates that "evm" is a known chain.
     let label = wallet_base_core::subject::wallet_label_checked(&p, "evm")
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
     // Local key cache: require the wallet row before touching the signer. A
     // missing row → the key was never created for this principal.
-    if Query::on(Wallet::TABLE)
+    let wallet_row = Query::on(Wallet::TABLE)
         .where_eq(Wallet::OWNER_PRINCIPAL, p.as_str())
         .where_eq(Wallet::CHAIN, "evm")
         .fetch_one()?
-        .is_none()
-    {
-        return Err(ApiError::bad_request("no evm wallet; create one first"));
-    }
+        .ok_or_else(|| ApiError::bad_request("no evm wallet; create one first"))?;
+    let wallet = Wallet::from_row(&wallet_row);
 
-    let intent: EvmIntent = body.into();
+    let mut intent: EvmIntent = body.into();
+    // Anchor the #15 post-assembly self-verify on the host-attested wallet
+    // address (never the body) — the sign path returns a broadcast-ready,
+    // fully-authorizing tx, so it self-verifies the signature like /send.
+    intent.from_address = wallet.address;
+
+    // ── Guardrails BEFORE the key is touched (#1) ──
+    // Sign-only returns a broadcast-ready, fully-authorizing tx, so it MUST honour
+    // the same block-list + spend policy as /send, and MUST debit daily-spend (or
+    // a caller bypasses the daily cap by signing N times). No simulation runs on
+    // this path, so contract-ness is inferred from calldata only and there is no
+    // revert signal (sim_success = true).
+    let total_fee_wei = {
+        let gas_limit = intent.gas_limit.unwrap_or(21_000) as u128;
+        let per_gas = if intent.legacy {
+            intent.gas_price.as_deref()
+        } else {
+            intent.max_fee_per_gas.as_deref()
+        };
+        let per_gas = per_gas.and_then(|s| s.trim().parse::<u128>().ok()).unwrap_or(0);
+        gas_limit.saturating_mul(per_gas).to_string()
+    };
+    let recipient = intent.to.clone().unwrap_or_default().to_lowercase();
+    enforce_spend_policy(
+        &p,
+        EVM_CHAIN,
+        &Spend {
+            value: intent.value_wei.clone(),
+            fee: total_fee_wei.clone(),
+            denom: "wei".to_string(),
+            recipient,
+            sim_success: true,
+        },
+    )?;
 
     let unsigned = EvmAdapter
         .build_unsigned(&intent, &ChainState::default())
@@ -636,8 +679,27 @@ fn evm_sign(Json(body): Json<EvmIntentReq>) -> Result<Json<SignOut>, ApiError> {
     let raw = EvmAdapter
         .assemble_signed(&unsigned, &sigs)
         .map_err(|e| ApiError::internal(e.to_string()))?;
+    let raw_hex = raw.to_hex();
 
-    Ok(Json(SignOut { raw: raw.to_hex() }))
+    // Record the signed tx + debit daily-spend (no broadcast job — the caller
+    // self-broadcasts). status `signed_external`.
+    let intent_json = serde_json::to_string(&intent)
+        .map_err(|e| ApiError::internal(format!("encode intent: {e}")))?;
+    let to_addr = intent.to.clone().unwrap_or_default();
+    let nonce_i64 = intent.nonce.unwrap_or(0) as i64;
+    record_external_sign(
+        &p,
+        EVM_CHAIN,
+        "wei",
+        &to_addr,
+        &intent.value_wei,
+        nonce_i64,
+        &total_fee_wei,
+        &raw_hex,
+        &intent_json,
+    )?;
+
+    Ok(Json(SignOut { raw: raw_hex }))
 }
 
 // ─── EVM fees ────────────────────────────────────────────────────────────────
@@ -662,18 +724,9 @@ struct FeesOut {
 /// a conservative max fee. Shared by the REST handler and the MCP
 /// `estimate_fee` tool.
 pub(crate) fn do_fees() -> Result<FeesOut, ApiError> {
-    use wallet_base_core::evm::rpc::{
-        base_fee_request, max_priority_fee_request, parse_base_fee, parse_max_priority_fee,
-    };
-
-    let tip_resp = call_evm_rpc(&max_priority_fee_request())?;
-    let tip = parse_max_priority_fee(&tip_resp)
-        .map_err(|e| ApiError::service_unavailable(e.to_string()))?;
-
-    let base_resp = call_evm_rpc(&base_fee_request())?;
-    let base = parse_base_fee(&base_resp)
-        .map_err(|e| ApiError::service_unavailable(e.to_string()))?;
-
+    // Shares fetch_base_and_tip, so the node-fee safety ceiling (#3) applies here
+    // too — /evm/fees never echoes an absurd node-reported fee.
+    let (base, tip) = fetch_base_and_tip()?;
     let max_fee = base.saturating_mul(2).saturating_add(tip);
 
     Ok(FeesOut {
@@ -727,14 +780,18 @@ pub(crate) fn do_simulate(principal: &str, body: EvmIntentReq) -> Result<SimOut,
     let from_addr = Wallet::from_row(&wallet_row).address;
 
     // Convert decimal value_wei → 0x-prefixed hex for the JSON-RPC call object.
-    // Parse as u128 (covers most practical amounts); fall back to "0x0" on parse
-    // failure so the call still reaches the node (which will surface the error).
-    let value_hex = body
-        .value_wei
-        .trim()
-        .parse::<u128>()
-        .map(|v| format!("0x{v:x}"))
-        .unwrap_or_else(|_| "0x0".to_string());
+    // This is the simulate-only path (no spend guardrail runs here), so an
+    // unparseable value must be an explicit error — NOT silently coerced to "0x0",
+    // which would simulate a different (zero-value) tx and could report
+    // success: true for a tx that behaves differently (#16).
+    let value_hex = {
+        let v = body
+            .value_wei
+            .trim()
+            .parse::<u128>()
+            .map_err(|_| ApiError::bad_request("value_wei must be a decimal u128"))?;
+        format!("0x{v:x}")
+    };
 
     // Normalize calldata: ensure it is "0x"-prefixed (or empty → "0x").
     let data = if body.data_hex.is_empty() || body.data_hex == "0x" {
@@ -819,6 +876,14 @@ pub(crate) const COSMOS_HRP: &str = "cosmos";
 /// Window length (seconds) of the rolling daily-spend accumulator.
 const DAILY_WINDOW_SECS: i64 = 24 * 60 * 60;
 
+/// Absolute safety ceiling (wei) on a NODE-supplied per-gas fee (base fee or
+/// priority tip). 10,000 gwei — multiple orders of magnitude above any sane
+/// mainnet fee, so it never rejects a legitimate spike, but fails closed when a
+/// malicious/compromised RPC node inflates the fee to drain the wallet via gas
+/// (review #3). Caller-supplied fees are bounded separately by the per-tx fee
+/// cap (`max_fee_wei`); this ceiling backstops the auto-fetch path.
+const MAX_NODE_FEE_PER_GAS_WEI: u128 = 10_000_000_000_000;
+
 /// Request / response body for the EVM spend policy. Caps are decimal-wei
 /// strings (`"0"` or empty = no cap); allowlists are arrays of lowercased `0x`
 /// addresses (empty = no restriction).
@@ -826,6 +891,12 @@ const DAILY_WINDOW_SECS: i64 = 24 * 60 * 60;
 struct PolicyReq {
     /// Per-transaction cap (decimal wei). `"0"`/empty = no per-tx cap.
     max_value_wei: String,
+    /// Per-transaction FEE cap (decimal wei). `"0"`/empty = no fee cap. Bounds
+    /// the resolved tx fee (gas/gas-price for EVM, `fee_amount` for Cosmos,
+    /// fee-rate×vsize for BTC) — the fund-drain guard. The fee also counts
+    /// toward the daily cap (total outflow = value + fee).
+    #[serde(default)]
+    max_fee_wei: String,
     /// Rolling 24h cap (decimal wei). `"0"`/empty = no daily cap.
     daily_cap_wei: String,
     /// Allowed recipient addresses (lowercased `0x`). Empty = no restriction.
@@ -841,6 +912,7 @@ impl Default for PolicyReq {
     fn default() -> Self {
         PolicyReq {
             max_value_wei: String::new(),
+            max_fee_wei: String::new(),
             daily_cap_wei: String::new(),
             recipient_allowlist: Vec::new(),
             contract_allowlist: Vec::new(),
@@ -864,6 +936,7 @@ impl From<&WalletPolicy> for PolicyReq {
     fn from(p: &WalletPolicy) -> Self {
         PolicyReq {
             max_value_wei: p.max_value_wei.clone(),
+            max_fee_wei: p.max_fee_wei.clone(),
             daily_cap_wei: p.daily_cap_wei.clone(),
             recipient_allowlist: parse_allowlist(&p.recipient_allowlist),
             contract_allowlist: parse_allowlist(&p.contract_allowlist),
@@ -910,6 +983,7 @@ pub(crate) fn put_policy_for(
     match load_policy(principal, chain)? {
         Some(mut existing) => {
             existing.max_value_wei = body.max_value_wei.clone();
+            existing.max_fee_wei = body.max_fee_wei.clone();
             existing.daily_cap_wei = body.daily_cap_wei.clone();
             existing.recipient_allowlist = recipient_allowlist;
             existing.contract_allowlist = contract_allowlist;
@@ -923,6 +997,7 @@ pub(crate) fn put_policy_for(
                 owner_principal: principal.to_string(),
                 chain: chain.to_string(),
                 max_value_wei: body.max_value_wei.clone(),
+                max_fee_wei: body.max_fee_wei.clone(),
                 daily_cap_wei: body.daily_cap_wei.clone(),
                 recipient_allowlist,
                 contract_allowlist,
@@ -978,6 +1053,116 @@ pub(crate) fn is_blocked(principal: &str) -> Result<bool, ApiError> {
     Ok(!hits.is_empty())
 }
 
+/// The resolved spend a chain handler hands to [`enforce_spend_policy`]. All
+/// amounts are decimal strings in the chain's base unit (wei / uatom / lamport /
+/// satoshi). `fee` is the resolved transaction fee (`""` = not resolved / network-
+/// set, treated as 0 by the guardrail) — see [`enforce_spend_policy`].
+pub(crate) struct Spend {
+    pub value: String,
+    pub fee: String,
+    /// Denom/unit of `value` — the daily-spend accumulator key (`wei` / `lamport`
+    /// / `sat` / the Cosmos base denom). Keeps multi-denom Cosmos caps honest (#6).
+    pub denom: String,
+    pub recipient: String,
+    pub sim_success: bool,
+}
+
+/// Run the full spend-policy gate for `(principal, chain)` — the single
+/// reject-before-signing enforcement point shared by EVERY key-touching path
+/// (`/*/send` AND `/*/sign`). Loads the caller's `WalletPolicy` + `DailySpend`
+/// window and runs `guardrails::check_policy`: per-tx value cap, **per-tx fee
+/// cap**, daily cap on total outflow (`value + fee`), recipient/contract
+/// allowlists, and refuse-on-revert. Fee bounding lives here so a huge
+/// caller/node-supplied fee can never drain the wallet past the value cap.
+///
+/// The caller must ALSO have checked [`is_blocked`] and must debit the SAME
+/// `(value, fee)` via [`upsert_daily_spend`] inside its persist `tx`.
+/// Persist a sign-only transaction (status `signed_external` — the caller will
+/// broadcast it themselves; NO `broadcast_tx` job) and debit the daily-spend
+/// accumulator in ONE store `tx`. Shared by all four `/*/sign` gates.
+///
+/// The daily debit is the load-bearing half: without it a caller bypasses the
+/// daily cap by calling `/sign` N times and self-broadcasting each signed tx.
+/// `value`/`fee` are the SAME amounts passed to [`enforce_spend_policy`];
+/// `nonce` reuses the `Transaction.nonce` column per the chain's convention
+/// (EVM nonce / Cosmos sequence / 0 for Solana+BTC).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_external_sign(
+    owner: &str,
+    chain: &str,
+    denom: &str,
+    to_addr: &str,
+    value: &str,
+    nonce: i64,
+    fee: &str,
+    raw_hex: &str,
+    intent_json: &str,
+) -> Result<u64, ApiError> {
+    let now_secs = now_millis() as i64 / 1000;
+    let now = Timestamp::new(now_millis() as i64);
+    tx::<_, _, ApiError>(|| {
+        let tx_id = db_insert(&Transaction {
+            id: Id::new(0),
+            owner_principal: owner.to_string(),
+            chain: chain.to_string(),
+            status: "signed_external".to_string(),
+            intent_json: intent_json.to_string(),
+            raw_hex: raw_hex.to_string(),
+            tx_hash: String::new(),
+            to_addr: to_addr.to_string(),
+            value_wei: value.to_string(),
+            nonce,
+            fee_wei: fee.to_string(),
+            sim_json: String::new(),
+            confirmations: 0,
+            created_at: now,
+            updated_at: now,
+        })
+        .map_err(ApiError::from)?;
+        upsert_daily_spend(owner, chain, denom, now_secs, value, fee, now)?;
+        Ok(tx_id)
+    })
+}
+
+pub(crate) fn enforce_spend_policy(
+    principal: &str,
+    chain: &str,
+    s: &Spend,
+) -> Result<(), ApiError> {
+    let policy = load_policy(principal, chain)?;
+    let now_secs = now_millis() as i64 / 1000;
+    let daily = load_daily_spend(principal, chain, &s.denom, now_secs)?;
+
+    let (max_value_wei, max_fee_wei, daily_cap_wei, recipient_allow, contract_allow, refuse_on_revert) =
+        match &policy {
+            Some(pol) => (
+                pol.max_value_wei.clone(),
+                pol.max_fee_wei.clone(),
+                pol.daily_cap_wei.clone(),
+                parse_allowlist(&pol.recipient_allowlist),
+                parse_allowlist(&pol.contract_allowlist),
+                pol.refuse_on_revert,
+            ),
+            None => (String::new(), String::new(), String::new(), Vec::new(), Vec::new(), true),
+        };
+
+    let pi = wallet_base_core::guardrails::PolicyInput {
+        value_wei: s.value.clone(),
+        fee_wei: s.fee.clone(),
+        max_value_wei,
+        max_fee_wei,
+        daily_cap_wei,
+        daily_spent_wei: daily.as_ref().map(|d| d.spent_wei.clone()).unwrap_or_default(),
+        recipient: s.recipient.clone(),
+        recipient_allowlist: recipient_allow,
+        contract_allowlist: contract_allow,
+        sim_success: s.sim_success,
+        refuse_on_revert,
+    };
+    wallet_base_core::guardrails::check_policy(&pi)
+        .map_err(|e| ApiError::bad_request(e.to_string()))
+}
+
 pub(crate) fn do_send(principal: &str, body: EvmIntentReq) -> Result<SendOut, ApiError> {
     use wallet_base_core::evm::rpc::{
         call_request, estimate_gas_request, nonce_request, parse_estimate_gas, parse_nonce,
@@ -1002,13 +1187,20 @@ pub(crate) fn do_send(principal: &str, body: EvmIntentReq) -> Result<SendOut, Ap
     let wallet = Wallet::from_row(&wallet_row);
 
     let mut intent: EvmIntent = body.into();
+    // Anchor the #15 post-assembly self-verify on the host-attested wallet
+    // address (never the body): assemble_signed recovers the signer from the
+    // signature and rejects a tx that doesn't recover to this address.
+    intent.from_address = wallet.address.clone();
 
-    // ── Resolve nonce (fetch if absent) ──
+    // ── Resolve nonce (reserve if absent) ──
+    // Fetch the chain's pending nonce OUTSIDE any store tx (outbound_http is
+    // denied inside a tx), then reserve through the durable per-account counter
+    // so two concurrent sends can't grab the same nonce (#8).
     if intent.nonce.is_none() {
         let resp = call_evm_rpc(&nonce_request(&wallet.address))?;
-        let nonce =
+        let on_chain_pending =
             parse_nonce(&resp).map_err(|e| ApiError::service_unavailable(e.to_string()))?;
-        intent.nonce = Some(nonce);
+        intent.nonce = Some(reserve_nonce(principal, EVM_CHAIN, on_chain_pending)?);
     }
 
     // ── Resolve fees (fetch if absent) ──
@@ -1062,42 +1254,38 @@ pub(crate) fn do_send(principal: &str, body: EvmIntentReq) -> Result<SendOut, Ap
         intent.gas_limit = Some(limit);
     }
 
-    // ── Guardrails — BEFORE signing ──
-    let policy = load_policy(principal, EVM_CHAIN)?;
-    let now_secs = now_millis() as i64 / 1000;
-    let daily = load_daily_spend(principal, EVM_CHAIN, now_secs)?;
-    let recipient = intent.to.clone().unwrap_or_default().to_lowercase();
-    // Heuristic: a destination is a contract if calldata is present OR the
-    // estimated gas exceeds a plain value transfer (21000).
-    let data_nonempty = !(intent.data_hex.is_empty() || intent.data_hex == "0x");
-    let to_is_contract = data_nonempty || sim.gas_used.map(|g| g > 21_000).unwrap_or(false);
-
-    let (max_value_wei, daily_cap_wei, recipient_allow, contract_allow, refuse_on_revert) =
-        match &policy {
-            Some(pol) => (
-                pol.max_value_wei.clone(),
-                pol.daily_cap_wei.clone(),
-                parse_allowlist(&pol.recipient_allowlist),
-                parse_allowlist(&pol.contract_allowlist),
-                pol.refuse_on_revert,
-            ),
-            None => (String::new(), String::new(), Vec::new(), Vec::new(), true),
+    // ── Resolved fee (gas_limit × per-gas) for the fee guard + daily outflow ──
+    // This is the WORST-CASE fee the signed tx authorizes — `gas_limit ×
+    // max_fee_per_gas` (1559) or `gas_limit × gas_price` (legacy). Bounding it is
+    // the fund-drain guard (#2): a tiny `value` with a huge node/caller fee must
+    // not slip past the value cap.
+    let total_fee_wei = {
+        let gas_limit = intent.gas_limit.unwrap_or(21_000) as u128;
+        let per_gas = if intent.legacy {
+            intent.gas_price.as_deref()
+        } else {
+            intent.max_fee_per_gas.as_deref()
         };
-
-    let pi = wallet_base_core::guardrails::PolicyInput {
-        value_wei: intent.value_wei.clone(),
-        max_value_wei,
-        daily_cap_wei,
-        daily_spent_wei: daily.as_ref().map(|d| d.spent_wei.clone()).unwrap_or_default(),
-        recipient,
-        recipient_allowlist: recipient_allow,
-        to_is_contract,
-        contract_allowlist: contract_allow,
-        sim_success: sim.success,
-        refuse_on_revert,
+        let per_gas = per_gas.and_then(|s| s.trim().parse::<u128>().ok()).unwrap_or(0);
+        gas_limit.saturating_mul(per_gas).to_string()
     };
-    wallet_base_core::guardrails::check_policy(&pi)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    // ── Guardrails — BEFORE signing (single enforcement point) ──
+    // The allowlist is enforced as a recipient ∪ contract union (#4) — we no
+    // longer derive contract-ness from the untrusted node's gas estimate.
+    let now_secs = now_millis() as i64 / 1000;
+    let recipient = intent.to.clone().unwrap_or_default().to_lowercase();
+    enforce_spend_policy(
+        principal,
+        EVM_CHAIN,
+        &Spend {
+            value: intent.value_wei.clone(),
+            fee: total_fee_wei.clone(),
+            denom: "wei".to_string(),
+            recipient,
+            sim_success: sim.success,
+        },
+    )?;
 
     // ── Sign (key is touched only after guardrails pass) ──
     let unsigned = EvmAdapter
@@ -1165,9 +1353,10 @@ pub(crate) fn do_send(principal: &str, body: EvmIntentReq) -> Result<SendOut, Ap
         })
         .map_err(ApiError::from)?;
 
-        // Accumulate the spend into today's window (slide/reset the window if
-        // stale, re-read inside the tx so a concurrent send can't be clobbered).
-        upsert_daily_spend(&owner, EVM_CHAIN, now_secs, &value_wei, now)?;
+        // Accumulate total outflow (value + fee) into today's window (slide/reset
+        // the window if stale, re-read inside the tx so a concurrent send can't be
+        // clobbered).
+        upsert_daily_spend(&owner, EVM_CHAIN, "wei", now_secs, &value_wei, &total_fee_wei, now)?;
 
         jobs_enqueue(JobSpec {
             handler: "broadcast_tx".into(),
@@ -1259,6 +1448,13 @@ fn fetch_base_and_tip() -> Result<(u128, u128), ApiError> {
     let base_resp = call_evm_rpc(&base_fee_request())?;
     let base = parse_base_fee(&base_resp)
         .map_err(|e| ApiError::service_unavailable(e.to_string()))?;
+    // Fail closed if the node reports an absurd fee — a malicious/compromised node
+    // must not be able to dictate an arbitrary gas spend (review #3).
+    if base > MAX_NODE_FEE_PER_GAS_WEI || tip > MAX_NODE_FEE_PER_GAS_WEI {
+        return Err(ApiError::service_unavailable(
+            "RPC node reported a gas fee above the safety ceiling",
+        ));
+    }
     Ok((base, tip))
 }
 
@@ -1295,11 +1491,13 @@ fn build_call_obj(from_addr: &str, intent: &EvmIntent) -> serde_json::Value {
 pub(crate) fn load_daily_spend(
     principal: &str,
     chain: &str,
+    denom: &str,
     now_secs: i64,
 ) -> Result<Option<DailySpend>, ApiError> {
     let row = Query::on(DailySpend::TABLE)
         .where_eq(DailySpend::OWNER_PRINCIPAL, principal)
         .where_eq(DailySpend::CHAIN, chain)
+        .where_eq(DailySpend::DENOM, denom)
         .fetch_one()?;
     let Some(row) = row else { return Ok(None) };
     let d = DailySpend::from_row(&row);
@@ -1319,22 +1517,41 @@ pub(crate) fn load_daily_spend(
 pub(crate) fn upsert_daily_spend(
     principal: &str,
     chain: &str,
+    denom: &str,
     now_secs: i64,
     value_wei: &str,
+    fee_wei: &str,
     now: Timestamp,
 ) -> Result<(), ApiError> {
     // independent-writes: a single-row upsert — the db_update / db_insert below
     // are mutually-exclusive branches (exactly one runs per call). Atomicity
     // with the Transaction insert is already guaranteed: this fn is only ever
-    // called from inside the `*_send` `tx::<_, _, ApiError>(|| …)` closure.
-    let add = value_wei
+    // called from inside the `*_send` / `*_sign` `tx::<_, _, ApiError>(|| …)`
+    // closure.
+    //
+    // The accumulator stores total OUTFLOW (value + fee), matching the daily-cap
+    // check in `guardrails::check_policy` (which bounds `spent + value + fee`).
+    // Debiting value-only would let cumulative fees escape the daily cap.
+    let value = value_wei
         .trim()
         .parse::<u128>()
         .map_err(|_| ApiError::bad_request("unparseable value_wei"))?;
+    let fee = {
+        let f = fee_wei.trim();
+        if f.is_empty() {
+            0u128
+        } else {
+            f.parse::<u128>().map_err(|_| ApiError::bad_request("unparseable fee_wei"))?
+        }
+    };
+    let add = value
+        .checked_add(fee)
+        .ok_or_else(|| ApiError::bad_request("value + fee overflow"))?;
 
     let existing = Query::on(DailySpend::TABLE)
         .where_eq(DailySpend::OWNER_PRINCIPAL, principal)
         .where_eq(DailySpend::CHAIN, chain)
+        .where_eq(DailySpend::DENOM, denom)
         .fetch_one()?
         .map(|r| DailySpend::from_row(&r));
 
@@ -1360,6 +1577,7 @@ pub(crate) fn upsert_daily_spend(
                 id: Id::new(0),
                 owner_principal: principal.to_string(),
                 chain: chain.to_string(),
+                denom: denom.to_string(),
                 window_start: now_secs,
                 spent_wei: add.to_string(),
                 updated_at: now,
@@ -1368,4 +1586,52 @@ pub(crate) fn upsert_daily_spend(
         }
     }
     Ok(())
+}
+
+/// Reserve the next nonce for `(principal, chain)` durably, serializing
+/// concurrent sends (#8). Fetch the chain's pending nonce OUTSIDE this call (it
+/// is `outbound_http`, denied inside a `tx`); pass it in. Inside one small store
+/// `tx` this reads the per-account counter, reserves
+/// `max(on_chain_pending, stored_next)`, and advances the counter to
+/// `reserved + 1`. Two concurrent reservations read+write the same row, so the
+/// loser's commit conflicts and the platform returns 409 — the client retries
+/// the whole request. A permanently-failed tx leaves a nonce GAP (inherent to
+/// EVM pending pipelines; see `NonceReservation`).
+pub(crate) fn reserve_nonce(
+    principal: &str,
+    chain: &str,
+    on_chain_pending: u64,
+) -> Result<u64, ApiError> {
+    let now = Timestamp::new(now_millis() as i64);
+    tx::<_, _, ApiError>(|| {
+        // independent-writes: a single-row upsert — the db_update / db_insert
+        // branches are mutually exclusive (exactly one runs). The read + write
+        // are atomic within this `tx`; concurrent reservers conflict on the row.
+        let existing = Query::on(NonceReservation::TABLE)
+            .where_eq(NonceReservation::OWNER_PRINCIPAL, principal)
+            .where_eq(NonceReservation::CHAIN, chain)
+            .fetch_one()?
+            .map(|r| NonceReservation::from_row(&r));
+        let stored_next = existing.as_ref().map(|n| n.next_nonce.max(0) as u64).unwrap_or(0);
+        let (reserved, new_stored) =
+            wallet_base_core::nonce::reserve(on_chain_pending, stored_next);
+        match existing {
+            Some(mut n) => {
+                n.next_nonce = new_stored as i64;
+                n.updated_at = now;
+                db_update(n.id.get(), &n).map_err(ApiError::from)?;
+            }
+            None => {
+                db_insert(&NonceReservation {
+                    id: Id::new(0),
+                    owner_principal: principal.to_string(),
+                    chain: chain.to_string(),
+                    next_nonce: new_stored as i64,
+                    updated_at: now,
+                })
+                .map_err(ApiError::from)?;
+            }
+        }
+        Ok(reserved)
+    })
 }

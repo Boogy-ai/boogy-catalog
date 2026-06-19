@@ -94,6 +94,11 @@ pub struct WalletPolicy {
     pub owner_principal: String,
     pub chain: String,
     pub max_value_wei: String,
+    /// Per-transaction fee cap (decimal). `"0"`/`""` = no fee cap. Bounds the
+    /// resolved tx fee (EVM `gas_limit × max_fee`, Cosmos `fee_amount`, BTC
+    /// `fee_rate × vsize`) so a huge fee cannot drain the wallet past the value
+    /// cap. The fee also counts toward `daily_cap_wei` (total outflow).
+    pub max_fee_wei: String,
     pub daily_cap_wei: String,
     pub recipient_allowlist: String, // JSON array as text
     pub contract_allowlist: String,  // JSON array as text
@@ -101,13 +106,22 @@ pub struct WalletPolicy {
     pub updated_at: Timestamp,
 }
 
-/// Rolling 24-hour spend accumulator per owner + chain.
+/// Rolling 24-hour spend accumulator per owner + chain + **denom**.
 ///
 /// - `owner_principal` (`#[index]`) is the tenancy column.
+/// - `chain` + `denom` complete the accumulator key. Keying by denom (not just
+///   chain) is load-bearing on multi-denom Cosmos: without it, sends of
+///   different denoms collapse into one bucket and the cap is meaningless (#6).
+///   Single-denom chains use a fixed native unit (`wei` / `lamport` / `sat`).
 /// - `window_start` is a Unix timestamp (seconds) marking the start of the
 ///   current 24-hour window; handlers slide the window on access.
-/// - `spent_wei` is a decimal string (u256-safe) accumulating confirmed spend
-///   within the window.
+/// - `spent_wei` is a decimal string (u256-safe) accumulating total OUTFLOW
+///   (value + fee) within the window for this `(chain, denom)`. Debited at
+///   SIGN time (in the same tx that persists the signed row), NOT at confirm
+///   time, and deliberately NOT credited back if the broadcast later fails —
+///   this fail-safe over-restricts (a user near their cap whose tx fails waits
+///   out the window) rather than risk under-counting a tx that actually landed
+///   (#17).
 /// - `list_by(filter = "owner_principal")` backs the owner's daily-spend view.
 #[derive(Model)]
 #[model(table = "daily_spend", list_by(filter = "owner_principal", newest = "updated_at"))]
@@ -117,8 +131,38 @@ pub struct DailySpend {
     #[index]
     pub owner_principal: String,
     pub chain: String,
+    pub denom: String,
     pub window_start: i64,
     pub spent_wei: String,
+    pub updated_at: Timestamp,
+}
+
+/// Per-(owner, chain) reservation counter for account-based nonces/sequences
+/// (EVM nonce today; the Cosmos sequence is the analogous future use).
+///
+/// - `owner_principal` (`#[index]`) is the tenancy column; one row per
+///   `(owner_principal, chain)` (same application-level pair-uniqueness pattern
+///   as `Wallet`, enforced by a residual `where_eq(chain)` inside the reserving
+///   `tx`).
+/// - `next_nonce` is the next nonce to hand out. Reserving reads the row, sets
+///   `reserved = max(on-chain pending, next_nonce)`, writes `next_nonce =
+///   reserved + 1`, all inside ONE store `tx` so two concurrent sends can't grab
+///   the same nonce — the loser's commit conflicts and the request retries (409).
+///   See `wallet_base_core::nonce::reserve` (#8).
+///
+/// Caveat (documented, by design): a permanently-failed/abandoned tx leaves a
+/// nonce GAP (the counter advanced but no tx ever lands at that nonce). This is
+/// inherent to EVM pending pipelines; a cancel/replace flow to fill gaps is out
+/// of scope.
+#[derive(Model)]
+#[model(table = "nonce_reservations", list_by(filter = "owner_principal", newest = "updated_at"))]
+pub struct NonceReservation {
+    #[pk]
+    pub id: Id<NonceReservation>,
+    #[index]
+    pub owner_principal: String,
+    pub chain: String,
+    pub next_nonce: i64,
     pub updated_at: Timestamp,
 }
 

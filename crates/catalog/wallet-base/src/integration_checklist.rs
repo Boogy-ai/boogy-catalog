@@ -135,6 +135,36 @@ fn label_cannot_be_set_from_body() {
     todo!("wire up in the integration harness")
 }
 
+/// **concurrent_evm_sends_get_distinct_nonces** (#8)
+///
+/// Scenario: two `POST /evm/send` requests for the SAME user race (neither tx
+/// has hit the chain yet, so the on-chain pending nonce is identical for both).
+///
+/// Expected: the durable `NonceReservation` counter serializes them — each send
+/// is assigned a DISTINCT nonce (`max(on-chain pending, stored_next)`, advancing
+/// `stored_next` by one per reservation). Because the reservation read+write
+/// happens inside one store `tx`, two truly-simultaneous reservers conflict on
+/// the row and the loser receives HTTP 409 (commit conflict) and retries the
+/// whole request, getting the next nonce. No two persisted EVM `Transaction`
+/// rows for one account ever share a nonce. The pure reservation arithmetic is
+/// proven by `wallet-base-core`'s `nonce.rs` tests; this stub is the
+/// handler-level confirmation under a real concurrent race.
+///
+/// Caveat (by design, not a bug): a permanently-failed/abandoned send leaves a
+/// nonce GAP — subsequent sends keep advancing and the gap nonce is never
+/// filled (inherent to EVM pending pipelines; cancel/replace is out of scope).
+#[cfg(test)]
+#[test]
+#[ignore = "needs the docker host + control-plane + store harness"]
+fn concurrent_evm_sends_get_distinct_nonces() {
+    // 1. Create an EVM wallet for user U; point the RPC stub at a fixed pending
+    //    nonce N (neither in-flight tx is visible to the node yet).
+    // 2. Fire two POST /evm/send concurrently (no explicit nonce in either body).
+    // 3. Assert the two persisted Transaction rows have nonces N and N+1 (in some
+    //    order) — never both N. A 409 on one is acceptable (client retries → N+1).
+    todo!("wire up in the integration harness")
+}
+
 // ─── Cosmos adversarial scenarios ──────────────────────────────────────────────
 //
 // The Cosmos surface (`/cosmos/*`) shares the security spine with EVM (host-
@@ -511,5 +541,75 @@ fn btc_each_input_signed_under_principal_label() {
     // 3. Assert the host made N signing_sign_digest calls (one per input), ALL under
     //    label "U#btc" — never the actor's label, never a body-supplied label.
     // 4. Verify the persisted Transaction row has owner_principal == U.
+    todo!("wire up in the integration harness")
+}
+
+/// **multi_chain_assemble_self_verifies_signature** (#15)
+///
+/// Scenario: every chain's `assemble_signed` now self-verifies the host-produced
+/// signature against the exact message it must sign BEFORE emitting the
+/// broadcast-ready tx — "sign what you see," enforced per chain:
+///   - BTC: each input's signature vs its BIP143 sighash under the sender pubkey.
+///   - Cosmos: the secp256k1 sig vs the SignDoc sighash under the signer pubkey.
+///   - Solana: the Ed25519 sig vs the serialized message under the fee-payer key.
+///   - EVM: recover the signer from the sighash + (r,s,recovery_id) and compare
+///     to the host-set wallet address (catches a wrong recovery bit / corrupt r,s
+///     that the recovery_id ∈ {0,1} range check alone cannot).
+/// A wrong/misordered/corrupt signature fails loud (no broadcast of a tx the
+/// network would reject or that recovers to the wrong account). The simulate
+/// read-paths (Cosmos/Solana) use a separate `assemble_for_simulation` that
+/// splices a dummy sig WITHOUT verification (node runs sigVerify off).
+///
+/// This is proven at Layer 1 (`wallet-base-core`): `btc/tx.rs`
+/// (`assemble_rejects_wrong_signature` / `…_misordered_signatures`),
+/// `cosmos/tx.rs` + `solana/tx.rs` (`assemble_accepts_valid_signature` /
+/// `assemble_rejects_wrong_signature`), and `tests/evm_vectors.rs`
+/// (`eip155_self_verify_accepts_correct_signer` / `…_rejects_wrong_signer`).
+/// This stub records the handler-level expectation that a host that ever returns
+/// a mismatched signature surfaces a 5xx and NEVER broadcasts.
+#[cfg(test)]
+#[test]
+#[ignore = "needs the docker host + control-plane + store harness"]
+fn multi_chain_assemble_self_verifies_signature() {
+    // 1. Drive a send on each chain to a successful broadcast (happy path).
+    // 2. With a fault-injected signer returning a wrong/misordered signature,
+    //    assert the send fails (5xx) and no Transaction row reaches `broadcasting`.
+    todo!("wire up in the integration harness")
+}
+
+/// **btc_fee_bound_and_counted_toward_cap** (#2 BTC fee bound)
+///
+/// Scenario: The coin-selected fee (`fee_rate_sat_vb × estimated vsize`) is now
+/// surfaced into the spend gate on BOTH `/btc/send` and `/btc/sign`, so the
+/// Bitcoin path enforces the per-tx fee cap and counts the fee toward the daily
+/// cap — identically to EVM/Cosmos (total outflow = value + fee).
+///
+/// Expected:
+/// - A `/btc/send` whose selected fee exceeds `max_fee_wei` (sats) is rejected
+///   BEFORE the key is touched (no signature, no broadcast, no daily debit).
+/// - A `/btc/send` where `value + fee` exceeds the daily cap is rejected even
+///   when `value` alone is within it.
+/// - On a successful send, the persisted `Transaction.fee_wei` equals the
+///   coin-selected fee and `DailySpend` is debited `value + fee` (denom `sat`).
+/// - `/btc/sign` enforces and debits the same way (the daily debit is mandatory
+///   on the sign path so the cap can't be bypassed by self-broadcasting).
+/// The pure fee bound + total-outflow accounting are already proven by
+/// `wallet-base-core`'s `guardrails.rs` (`fee_over_fee_cap_rejected`,
+/// `fee_counts_toward_daily_cap`) and the surfaced fee by `coinselect.rs`; this
+/// stub is the handler-level confirmation that the BTC path wires the selected
+/// fee into the gate and the ledger.
+#[cfg(test)]
+#[test]
+#[ignore = "needs the docker host + control-plane + store harness"]
+fn btc_fee_bound_and_counted_toward_cap() {
+    // 1. Create a btc wallet for user U funded by a confirmed UTXO.
+    // 2. PUT /btc/policy with a tiny per-tx fee cap (max_fee_wei in sats) and a
+    //    high fee_rate_sat_vb on the send so the selected fee exceeds it.
+    // 3. POST /btc/send → assert HTTP 400 (over fee cap), no Transaction row, no
+    //    DailySpend debit.
+    // 4. Set a daily cap where value alone fits but value + fee does not; assert
+    //    the send is rejected for the daily cap.
+    // 5. On an in-policy send, assert Transaction.fee_wei == the selected fee and
+    //    DailySpend advanced by value + fee.
     todo!("wire up in the integration harness")
 }

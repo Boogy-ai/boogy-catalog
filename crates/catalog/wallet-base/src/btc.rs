@@ -1,4 +1,10 @@
-//! Bitcoin (`/btc/*`) service handlers — external-signer mode.
+//! Bitcoin (`/btc/*`) service handlers.
+//!
+//! **Trust model: CUSTODIAL.** The host holds the signing key (via the `signing`
+//! capability) and signs on the user's behalf; this wasm never holds private key
+//! material. "host-signed" here means the key is external to the *wasm* — NOT
+//! that the end user signs. The threat surface is the full custodial one: a bug
+//! here moves user funds, so every `/send` AND `/sign` path gates identically.
 //!
 //! Mirrors the EVM/Cosmos/Solana surface (`sign` / `fees` / `send` / `policy`)
 //! but over a UTXO chain via `wallet_base_core::btc::BtcAdapter` and the Esplora
@@ -47,9 +53,9 @@ use wallet_base_core::types::{Secp256k1Signature, SignRequest};
 use crate::models::{Transaction, Wallet};
 use crate::rpc_client::call_btc_rpc_json;
 use crate::{
-    auth, db_insert, is_blocked, jobs_enqueue, load_daily_spend, load_policy, now_millis,
-    parse_allowlist, put_policy_for, signing_sign_digest, tx, upsert_daily_spend, ApiError, Json,
-    PolicyReq, Query, Req, SendOut, SignOut, BTC_CHAIN, BTC_NETWORK,
+    auth, db_insert, enforce_spend_policy, is_blocked, jobs_enqueue, load_policy, now_millis,
+    put_policy_for, record_external_sign, signing_sign_digest, tx, upsert_daily_spend, ApiError,
+    Json, PolicyReq, Query, Req, SendOut, SignOut, Spend, BTC_CHAIN, BTC_NETWORK,
 };
 
 /// Default confirmation target (blocks) for the send-path fee estimate when the
@@ -175,11 +181,16 @@ fn sign_and_assemble(
 ///
 /// The UTXO set + fee rate are REQUIRED in the body (no on-chain fetch); the
 /// compressed pubkey + network come from the caller's stored wallet row. The
-/// signing label is host-derived. No guardrails, no broadcast, no persistence —
-/// this is the raw sign-only seam (parity with `/evm/sign`, `/cosmos/sign`,
-/// `/solana/sign`).
+/// signing label is host-derived. Gated identically to `/btc/send` (block-list +
+/// spend policy + mandatory daily-spend debit; #1) — the returned raw tx is a
+/// complete, self-broadcastable spend of the custodial key. No broadcast.
 pub fn btc_sign(Json(body): Json<BtcSignReq>) -> Result<Json<SignOut>, ApiError> {
     let p = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
+
+    // A blocked principal cannot sign.
+    if is_blocked(&p)? {
+        return Err(ApiError::forbidden("this account is blocked"));
+    }
 
     // Label is host-derived; this also validates "btc" as a known chain.
     let label = wallet_base_core::subject::wallet_label_checked(&p, BTC_CHAIN)
@@ -192,15 +203,56 @@ pub fn btc_sign(Json(body): Json<BtcSignReq>) -> Result<Json<SignOut>, ApiError>
         network: BTC_NETWORK,
         to_address: body.to_address,
         amount_sat: body.amount_sat,
-        fee_rate_sat_vb: body.fee_rate_sat_vb,
+        // Floor at 1 sat/vB (#12): a 0 fee-rate signs an unrelayable zero-fee tx.
+        fee_rate_sat_vb: body.fee_rate_sat_vb.max(1),
         utxos: body.utxos.into_iter().map(Utxo::from).collect(),
     };
+
+    // ── Resolve the selected fee (#2 BTC fee bound) ──
+    // Same pure, deterministic selection `build_unsigned` re-runs below, so the
+    // fee enforced is exactly the fee of the tx that gets signed.
+    let fee_sat = wallet_base_core::btc::select_coins(
+        &intent.utxos,
+        intent.amount_sat,
+        intent.fee_rate_sat_vb,
+    )
+    .map_err(|e| ApiError::bad_request(e.to_string()))?
+    .fee_sat
+    .to_string();
+
+    // ── Guardrails BEFORE the key is touched (#1). Fee bounded + counted (#2).
+    enforce_spend_policy(
+        &p,
+        BTC_CHAIN,
+        &Spend {
+            value: intent.amount_sat.to_string(),
+            fee: fee_sat.clone(),
+            denom: "sat".to_string(),
+            recipient: intent.to_address.clone(),
+            sim_success: true,
+        },
+    )?;
 
     // Coin selection + the N BIP143 sighashes happen inside build_unsigned; a
     // bad intent (insufficient funds, wrong-network destination) is a 400.
     let unsigned = BtcAdapter::build_unsigned(&intent)
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let raw = sign_and_assemble(&label, &unsigned)?;
+
+    // Record the signed tx + debit daily-spend (value + fee; no broadcast job).
+    let intent_json = serde_json::to_string(&serialize_intent(&intent))
+        .map_err(|e| ApiError::internal(format!("encode intent: {e}")))?;
+    record_external_sign(
+        &p,
+        BTC_CHAIN,
+        "sat",
+        &intent.to_address,
+        &intent.amount_sat.to_string(),
+        0,
+        &fee_sat,
+        &raw,
+        &intent_json,
+    )?;
 
     Ok(Json(SignOut { raw }))
 }
@@ -263,8 +315,10 @@ pub fn do_btc_send(principal: &str, body: BtcSendReq) -> Result<SendOut, ApiErro
         .collect();
 
     // ── Resolve fee rate: body wins, else fetch the 6-block estimate (pre-tx) ──
+    // Floor at 1 sat/vB (#12): a 0 fee-rate yields a zero-fee tx the network
+    // rejects ("min relay fee not met") after a wasted key-touch.
     let fee_rate_sat_vb = match body.fee_rate_sat_vb {
-        Some(r) => r,
+        Some(r) => r.max(1),
         None => {
             let resp = call_btc_rpc_json(&fee_estimates_request())?;
             parse_fee_estimate(&resp, SEND_FEE_TARGET_BLOCKS)
@@ -281,43 +335,40 @@ pub fn do_btc_send(principal: &str, body: BtcSendReq) -> Result<SendOut, ApiErro
         utxos,
     };
 
-    // ── Guardrails — BEFORE signing ──
-    // value = the transfer amount in satoshis (a decimal string for the generic
-    // wei-named guardrail); recipient = the bech32 to_address (canonical
-    // lowercase already — do NOT re-case it). A Bitcoin transfer carries no
-    // contract calldata, so to_is_contract = false and the contract allowlist is
-    // empty. There is no simulate on a UTXO chain, so sim_success = true (no
-    // revert signal to enforce).
-    let policy = load_policy(principal, BTC_CHAIN)?;
+    // ── Resolve the selected fee (#2 BTC fee bound) ──
+    // Coin-select here to surface the fee this transfer pays, so the per-tx fee
+    // cap AND the total-outflow (value + fee) daily cap apply to BTC like the
+    // other chains. `select_coins` is pure + deterministic and is the SAME
+    // selection `build_unsigned` re-runs internally below, so the fee enforced is
+    // exactly the fee of the tx that gets signed. A selection failure (no/dust
+    // UTXOs, insufficient funds) is a caller error → 400.
+    let fee_sat = wallet_base_core::btc::select_coins(
+        &intent.utxos,
+        intent.amount_sat,
+        intent.fee_rate_sat_vb,
+    )
+    .map_err(|e| ApiError::bad_request(e.to_string()))?
+    .fee_sat
+    .to_string();
+
+    // ── Guardrails — BEFORE signing (single enforcement point) ──
+    // value = the transfer amount in satoshis; recipient = the bech32 to_address
+    // (canonical lowercase already — do NOT re-case it). A Bitcoin transfer
+    // carries no contract calldata. No simulate on a UTXO chain, so
+    // sim_success = true. `fee` = the coin-selected fee (above), bounded by the
+    // policy's per-tx fee cap and counted toward the daily cap.
     let now_secs = now_millis() as i64 / 1000;
-    let daily = load_daily_spend(principal, BTC_CHAIN, now_secs)?;
-
-    let (max_value_wei, daily_cap_wei, recipient_allow, _contract_allow, refuse_on_revert) =
-        match &policy {
-            Some(pol) => (
-                pol.max_value_wei.clone(),
-                pol.daily_cap_wei.clone(),
-                parse_allowlist(&pol.recipient_allowlist),
-                parse_allowlist(&pol.contract_allowlist),
-                pol.refuse_on_revert,
-            ),
-            None => (String::new(), String::new(), Vec::new(), Vec::new(), true),
-        };
-
-    let pi = wallet_base_core::guardrails::PolicyInput {
-        value_wei: intent.amount_sat.to_string(),
-        max_value_wei,
-        daily_cap_wei,
-        daily_spent_wei: daily.as_ref().map(|d| d.spent_wei.clone()).unwrap_or_default(),
-        recipient: intent.to_address.clone(),
-        recipient_allowlist: recipient_allow,
-        to_is_contract: false,
-        contract_allowlist: Vec::new(),
-        sim_success: true,
-        refuse_on_revert,
-    };
-    wallet_base_core::guardrails::check_policy(&pi)
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    enforce_spend_policy(
+        principal,
+        BTC_CHAIN,
+        &Spend {
+            value: intent.amount_sat.to_string(),
+            fee: fee_sat.clone(),
+            denom: "sat".to_string(),
+            recipient: intent.to_address.clone(),
+            sim_success: true,
+        },
+    )?;
 
     // ── Build the unsigned tx (coin-select + N sighashes happen inside) ──
     // A coin-select failure (insufficient funds, dust, wrong-network address) is
@@ -351,10 +402,8 @@ pub fn do_btc_send(principal: &str, body: BtcSendReq) -> Result<SendOut, ApiErro
             // Bitcoin has no per-account nonce/sequence (UTXO chain). The nonce
             // column is unused here; 0 is a placeholder.
             nonce: 0,
-            // The exact selected fee isn't surfaced by the adapter today; leave
-            // blank rather than guess. The fee is implied by inputs − outputs on
-            // the broadcast tx.
-            fee_wei: String::new(),
+            // The coin-selected fee (sat) — same fee enforced by the guardrail.
+            fee_wei: fee_sat.clone(),
             sim_json: String::new(),
             confirmations: 0,
             created_at: now,
@@ -362,7 +411,9 @@ pub fn do_btc_send(principal: &str, body: BtcSendReq) -> Result<SendOut, ApiErro
         })
         .map_err(ApiError::from)?;
 
-        upsert_daily_spend(&owner, BTC_CHAIN, now_secs, &value_sat, now)?;
+        // Debit value + fee (total outflow) against the daily cap, consistent
+        // with the guardrail that just allowed it.
+        upsert_daily_spend(&owner, BTC_CHAIN, "sat", now_secs, &value_sat, &fee_sat, now)?;
 
         jobs_enqueue(JobSpec {
             handler: "broadcast_tx".into(),

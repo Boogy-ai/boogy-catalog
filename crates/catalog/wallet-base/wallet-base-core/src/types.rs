@@ -20,6 +20,12 @@ pub enum SignRequest { Digest([u8; 32]), Message(Vec<u8>) }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvmIntent {
     pub to: Option<String>,        // 0x-hex address; None = contract creation
+    /// The signer's 0x address (host-derived from the wallet key). Used ONLY to
+    /// self-verify that the assembled signature recovers to it (#15). Empty =
+    /// skip the recover-and-compare (lower-level encoding paths / unit fixtures);
+    /// the production send path always sets it from the wallet row.
+    #[serde(default)]
+    pub from_address: String,
     pub value_wei: String,         // decimal string (u256-safe)
     pub data_hex: String,          // 0x-prefixed calldata ("" or "0x" = empty)
     pub chain_id: u64,

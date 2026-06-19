@@ -82,10 +82,19 @@ fn solana_build_unsigned_matches_message_snapshot() {
 fn solana_assemble_roundtrips_into_transaction() {
     use solana_transaction::Transaction;
 
-    let unsigned = SolanaAdapter::build_unsigned(&fixture_intent()).unwrap();
+    use ed25519_dalek::{Signer, SigningKey};
 
-    // Dummy raw 64-byte Ed25519 signature (no recovery id, no r/s split).
-    let sig = [0xCDu8; 64];
+    // A REAL Ed25519 keypair; the intent's `from` is its pubkey so the signature
+    // verifies. The post-assembly self-verify (#15) now rejects a dummy sig.
+    let sk = SigningKey::from_bytes(&[0x33u8; 32]);
+    let intent = SolanaIntent {
+        from_pubkey_hex: hex::encode(sk.verifying_key().to_bytes()),
+        ..fixture_intent()
+    };
+    let unsigned = SolanaAdapter::build_unsigned(&intent).unwrap();
+
+    // Sign the exact message bytes (== preimage) the Ed25519 path commits to.
+    let sig = sk.sign(&unsigned.preimage).to_bytes();
     let raw: RawTx = SolanaAdapter::assemble_signed(&unsigned, &sig).unwrap();
 
     // Decode the Transaction back and assert structure survives.
