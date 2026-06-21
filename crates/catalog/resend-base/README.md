@@ -342,7 +342,7 @@ flowchart TD
 
 1. **Build:** `cargo build -p resend-base --target wasm32-wasip2 --release`
 2. **Provision** from `boogy.toml`. The owner is taken from your authenticated
-   deploy — the manifest's `[service.owner]` is a placeholder. Capabilities:
+   deploy — any `owner` set in the manifest is just a placeholder. Capabilities:
    `store`, `auth`, `clock`, `entropy`, `outbound_http`, `background_jobs`
    (self-identity is ungated — always available).
 3. **Bind your Resend key** (the full header value):
