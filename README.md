@@ -92,7 +92,7 @@ CLI from the SDK repo.
 
 Expert skills for building Boogy services are published as agent skills:
 `boogy skills install` (or `npx degit Boogy-ai/boogy-superpowers/skills
-.claude/skills` — flat, no wrapper suffix; then `/reload-plugins`). The SDK's
+.claude/skills` — flat, no wrapper suffix; then `/reload-skills`). The SDK's
 `AGENTS.md` is the canonical handler-authoring reference.
 
 ## License
