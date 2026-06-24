@@ -463,7 +463,7 @@ deploy — the owner is your deploying principal.
      boogy secret set <owner>/stripe-base/stripe_webhook_secret --stdin
    ```
 
-4. **Point a Stripe webhook** at `https://<host>/<owner>/webhook` for the
+4. **Point a Stripe webhook** at `https://<handle>.<base>/<service>/webhook` for the
    `checkout.session.completed` event.
 
 5. **Create checkouts** — from your apps (peer call) or directly (owner).
@@ -474,7 +474,7 @@ deploy — the owner is your deploying principal.
 
 ```bash
 # 1. Create a checkout (async default; as the owner — a peer app omits client_ref)
-curl -X POST https://<host>/<owner>/checkout \
+curl -X POST https://<handle>.<base>/<service>/checkout \
   -H "authorization: Bearer <token>" -H 'content-type: application/json' \
   -d '{"amount":2000,"currency":"usd","product_name":"Pro Plan",
        "success_url":"https://app/ok","cancel_url":"https://app/cancel",
@@ -485,7 +485,7 @@ curl -X POST https://<host>/<owner>/checkout \
 #    is {"order_id":42,"status":"pending","checkout_url":"https://checkout.stripe.com/…"}.
 
 # 2. Poll the order until the job has created the session (status → "pending").
-curl "https://<host>/<owner>/orders/42" -H "authorization: Bearer <token>"
+curl "https://<handle>.<base>/<service>/orders/42" -H "authorization: Bearer <token>"
 # → {"id":42,"status":"pending","checkout_url":"https://checkout.stripe.com/c/pay/cs_…",...}
 # redirect the buyer to checkout_url
 
@@ -494,7 +494,7 @@ curl "https://<host>/<owner>/orders/42" -H "authorization: Bearer <token>"
 #    durable apply job flips order 42 to "paid".
 
 # 4. Check the order (owner sees all apps; ?client= to filter)
-curl "https://<host>/<owner>/orders?client=storefront" \
+curl "https://<handle>.<base>/<service>/orders?client=storefront" \
   -H "authorization: Bearer <token>"
 # → {"items":[{"id":42,"client_service":"storefront","status":"paid",...}],"count":1}
 ```

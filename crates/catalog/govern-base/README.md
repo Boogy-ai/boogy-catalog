@@ -685,19 +685,19 @@ mode = "public"
 
 ```bash
 # 1. Configure: a member-gated space, short windows for the demo
-curl -X PUT https://<host>/<owner>/admin/config \
+curl -X PUT https://<handle>.<base>/<service>/admin/config \
   -H "authorization: Bearer <owner-token>" -H 'content-type: application/json' \
   -d '{"eligibility":"members","sponsorship_threshold":1,"quorum":"0.4",
        "threshold":"0.5","veto_threshold":"0.334","min_voting_period_ms":3600000}'
 
 # 2. Add members to the roll
-curl -X POST https://<host>/<owner>/admin/members \
+curl -X POST https://<handle>.<base>/<service>/admin/members \
   -H "authorization: Bearer <owner-token>" -H 'content-type: application/json' \
   -d '{"principal":"agent_018f...alice"}'
 # (repeat for bob; → {"principal":"agent_...","weight":1,"role":""})
 
 # 3. Alice creates a proposal that, if passed, calls the treasury service
-curl -X POST https://<host>/<owner>/proposals \
+curl -X POST https://<handle>.<base>/<service>/proposals \
   -H "authorization: Bearer <alice-token>" -H 'content-type: application/json' \
   -d '{"title":"Fund the docs grant","body":"Pay 500 to the docs team.",
        "actions":[{"action_type":"peer","method":"POST",
@@ -706,23 +706,23 @@ curl -X POST https://<host>/<owner>/proposals \
 # → {"id":7,"status":"draft"}
 
 # 4. Open it; Bob co-sponsors → voting opens (electorate snapshotted)
-curl -X POST https://<host>/<owner>/proposals/7/submit  -H "authorization: Bearer <alice-token>"
-curl -X POST https://<host>/<owner>/proposals/7/sponsor -H "authorization: Bearer <bob-token>"
+curl -X POST https://<handle>.<base>/<service>/proposals/7/submit  -H "authorization: Bearer <alice-token>"
+curl -X POST https://<handle>.<base>/<service>/proposals/7/sponsor -H "authorization: Bearer <bob-token>"
 
 # 5. Members vote
-curl -X POST https://<host>/<owner>/proposals/7/vote \
+curl -X POST https://<handle>.<base>/<service>/proposals/7/vote \
   -H "authorization: Bearer <alice-token>" -H 'content-type: application/json' -d '{"option":"yes"}'
-curl -X POST https://<host>/<owner>/proposals/7/vote \
+curl -X POST https://<handle>.<base>/<service>/proposals/7/vote \
   -H "authorization: Bearer <bob-token>"   -H 'content-type: application/json' -d '{"option":"yes"}'
 
 # 6. Watch the tally live (optional) or poll it
-curl "https://<host>/<owner>/proposals/7/tally" -H "authorization: Bearer <alice-token>"
+curl "https://<handle>.<base>/<service>/proposals/7/tally" -H "authorization: Bearer <alice-token>"
 # → {"yes":2,"no":0,"abstain":0,"veto":0,"ballots":2}
 
 # 7. After voting_end the tally finalizes; if it passes with actions it enters
 #    timelock, then execute_proposal calls the treasury service — exactly once,
 #    exactly as encoded in the proposal.
-curl "https://<host>/<owner>/proposals/7" -H "authorization: Bearer <alice-token>"
+curl "https://<handle>.<base>/<service>/proposals/7" -H "authorization: Bearer <alice-token>"
 # → {"id":7,"status":"executed", ... "final_yes":2, "final_ballots":2, ...}
 ```
 

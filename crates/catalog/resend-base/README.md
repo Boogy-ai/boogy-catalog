@@ -357,13 +357,13 @@ flowchart TD
 
 ```bash
 # Transaction-safe send (default): enqueues a durable job
-curl -X POST https://<host>/<owner>/send \
+curl -X POST https://<handle>.<base>/<service>/send \
   -H "authorization: Bearer <token>" -H 'content-type: application/json' \
   -d '{"to":"ada@example.com","from":"hello@acme.com","template_id":"12","vars":[["name","Ada"]]}'
 # → 200 {"message_id":99,"status":"queued"}   (sent once the job runs)
 
 # Batch
-curl -X POST https://<host>/<owner>/send/batch \
+curl -X POST https://<handle>.<base>/<service>/send/batch \
   -H "authorization: Bearer <token>" -H 'content-type: application/json' \
   -d '{"from":"hello@acme.com","default_template_id":"12",
        "recipients":[{"to":"a@x.com","vars":[["name","A"]]},{"to":"b@y.com","vars":[["name","B"]]}]}'
@@ -371,7 +371,7 @@ curl -X POST https://<host>/<owner>/send/batch \
 
 # Operator surface (/admin/*) — the SERVICE OWNER curls it directly with their
 # own token (the host attests caller_is_service_owner host-side). Block a sender:
-curl -X POST https://<host>/<owner>/admin/blocks \
+curl -X POST https://<handle>.<base>/<service>/admin/blocks \
   -H "authorization: Bearer <owner-token>" -H 'content-type: application/json' \
   -d '{"principal":"agent_018f...","reason":"abuse"}'
 # A non-owner gets 403. The owner's own backend can also call it as a workload
