@@ -13,7 +13,8 @@ use govern_base_core::ProposalStatus;
 use crate::bindings::boogy::platform::outbound_http;
 use crate::models::{Proposal, ProposalAction};
 use crate::{
-    db_find_by, db_update, get_row, jobs_enqueue, now_ms, peer_fetch, tx, Deserialize, ApiError,
+    db_find_by, db_update, get_row, jobs_enqueue, now_ms, peer_fetch_raw, tx, Deserialize,
+    ApiError,
 };
 use boogy_sdk::jobs::JobSpec;
 use boogy_sdk::{job, JobContext, JobError};
@@ -205,7 +206,12 @@ fn run_action(a: &ProposalAction) -> Result<String, String> {
             if let Some(b) = body {
                 peer_req = peer_req.body_bytes(b);
             }
-            let resp = peer_fetch(&a.target, &peer_req)
+            // `peer_fetch_raw`: this classifies success/failure by status
+            // itself (mirroring the `outbound_http` branch above), so it
+            // needs the raw response even for a non-2xx status rather than
+            // the checked default treating that as an error before we get
+            // to classify it ourselves.
+            let resp = peer_fetch_raw(&a.target, &peer_req)
                 .map_err(|e| format!("peer: {e}"))?;
             if resp.is_success() {
                 Ok(format!("peer {}", resp.status))
