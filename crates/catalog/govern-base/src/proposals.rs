@@ -266,7 +266,13 @@ pub fn submit_proposal(req: &mut Req<'_>) -> Result<Json<ProposalOut>, ApiError>
             p.voting_start = now;
             p.voting_end = now + period;
             // Snapshot electorate size so decide() quorum gate is non-zero for
-            // bounded eligibility modes.
+            // bounded eligibility modes. This unfiltered count reads row keys
+            // only (no row payloads), but it reads the WHOLE key range inside
+            // this transaction, so it conflicts with any concurrent member
+            // insert, removal, or edit (updating a row rewrites its keys).
+            // Acceptable here — membership changes are rare
+            // relative to proposals — but do not copy the pattern onto a table
+            // with a live write stream.
             p.total_eligible_power = if cfg.eligibility != "open" {
                 crate::Query::on(crate::models::Member::TABLE)
                     .count()

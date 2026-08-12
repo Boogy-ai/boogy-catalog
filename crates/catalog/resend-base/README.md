@@ -295,8 +295,9 @@ One instance serves **one app**, and within it the **sending principal** is the
 sub-tenant. End users see only their own mail; the **app admin** needs to see
 across everyone and to stop abuse. That's the `/admin/*` surface.
 
-**Access is gated by the host-attested `caller_is_service_owner` capability — no
-identity is hardcoded** (the module is provisionable by anyone):
+**Access is gated by the host-attested `caller_is_service_owner()` check — no
+identity is hardcoded** (the module is provisionable by anyone). It is a
+`runtime` call, not a manifest capability; there is nothing to grant:
 
 - `/admin/*` ingress is just `mode = "authenticated"` (rejects anonymous; no
   per-route override, names nobody).
