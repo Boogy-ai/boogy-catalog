@@ -563,7 +563,7 @@ fn ensure_wallet(Json(body): Json<EnsureWalletReq>) -> Result<Json<WalletOut>, A
 
 /// `GET /wallets` — list the caller's wallets across all chains.
 fn list_wallets(_req: &mut Req<'_>) -> Result<Json<Vec<WalletOut>>, ApiError> {
-    let rows = auth::find_owned(Wallet::TABLE, Wallet::OWNER_PRINCIPAL)?;
+    let rows = auth::find_owned::<Wallet>(Wallet::OWNER_PRINCIPAL)?;
     let out = rows
         .iter()
         .map(|r| {
