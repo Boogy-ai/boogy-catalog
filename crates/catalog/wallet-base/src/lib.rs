@@ -49,7 +49,7 @@ use boogy_sdk::jobs::JobSpec;
 use boogy_sdk::model::{Id, Model, Timestamp};
 use boogy_sdk::pagination::decode;
 use boogy_sdk::signing::SigAlg;
-use boogy_sdk::{Api, JobRouter};
+use boogy_sdk::{schema_decl::Schema, Api, JobRouter};
 use wallet_base_core::btc::{BtcAdapter, BtcNetwork};
 use wallet_base_core::cosmos::CosmosAdapter;
 use wallet_base_core::evm::EvmAdapter;
@@ -59,14 +59,14 @@ use wallet_base_core::types::{ChainAdapter, ChainState, EvmIntent, SignRequest};
 struct WalletBase;
 
 impl Api for WalletBase {
-    fn init_tables() {
-        create_model::<Wallet>();
-        create_model::<Transaction>();
-        create_model::<WalletPolicy>();
-        create_model::<DailySpend>();
-        create_model::<BlockedPrincipal>();
-        create_model::<AdminAudit>();
-        create_model::<NonceReservation>();
+    fn schema(s: &mut Schema) {
+        s.model::<Wallet>();
+        s.model::<Transaction>();
+        s.model::<WalletPolicy>();
+        s.model::<DailySpend>();
+        s.model::<BlockedPrincipal>();
+        s.model::<AdminAudit>();
+        s.model::<NonceReservation>();
     }
 
     fn build_router() -> Router {

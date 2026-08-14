@@ -48,7 +48,7 @@ use boogy_sdk::jobs::JobSpec;
 use boogy_sdk::model::{Id, Model, Timestamp};
 use boogy_sdk::pagination::{decode, CursorPage};
 use boogy_sdk::store::{SortDir, Val};
-use boogy_sdk::{Api, JobRouter};
+use boogy_sdk::{schema_decl::Schema, Api, JobRouter};
 
 use bindings::boogy::platform::outbound_http;
 use stripe_base_core::CheckoutInput;
@@ -68,14 +68,14 @@ const OWNER_SENTINEL: &str = "_owner/direct";
 struct StripeBase;
 
 impl Api for StripeBase {
-    fn init_tables() {
+    fn schema(s: &mut Schema) {
         // Typed registration: each model's schema (columns + the indexes its
         // `#[index]` / `#[lookup_by]` attrs imply) is created from the
         // `#[derive(Model)]` definition; no hand-built `Table`.
-        create_model::<Order>();
-        create_model::<WebhookEvent>();
-        create_model::<BlockedClient>();
-        create_model::<AdminAudit>();
+        s.model::<Order>();
+        s.model::<WebhookEvent>();
+        s.model::<BlockedClient>();
+        s.model::<AdminAudit>();
     }
 
     fn build_router() -> Router {

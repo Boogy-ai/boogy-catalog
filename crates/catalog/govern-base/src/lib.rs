@@ -17,7 +17,7 @@ mod bindings {
 
 boogy_sdk::wit_glue!(bindings, GovernBase, with_jobs);
 
-use boogy_sdk::{Api, JobRouter};
+use boogy_sdk::{schema_decl::Schema, Api, JobRouter};
 
 mod admin;
 mod comments;
@@ -134,15 +134,15 @@ pub fn gate_read() -> Result<(), ApiError> {
 struct GovernBase;
 
 impl Api for GovernBase {
-    fn init_tables() {
-        create_model::<Config>();
-        create_model::<Member>();
-        create_model::<Proposal>();
-        create_model::<ProposalAction>();
-        create_model::<Vote>();
-        create_model::<Sponsorship>();
-        create_model::<Comment>();
-        create_model::<AdminAudit>();
+    fn schema(s: &mut Schema) {
+        s.model::<Config>();
+        s.model::<Member>();
+        s.model::<Proposal>();
+        s.model::<ProposalAction>();
+        s.model::<Vote>();
+        s.model::<Sponsorship>();
+        s.model::<Comment>();
+        s.model::<AdminAudit>();
     }
 
     fn build_router() -> Router {

@@ -44,7 +44,7 @@ use boogy_sdk::jobs::JobSpec;
 use boogy_sdk::model::{Id, Model, Timestamp};
 use boogy_sdk::pagination::{decode, CursorPage};
 use boogy_sdk::store::{SortDir, Val};
-use boogy_sdk::{Api, JobRouter};
+use boogy_sdk::{schema_decl::Schema, Api, JobRouter};
 
 use bindings::boogy::platform::outbound_http;
 use resend_base_core::{render, workload_owner, SendInput};
@@ -56,10 +56,10 @@ use models::{BlockedSender, Message, Template};
 struct ResendBase;
 
 impl Api for ResendBase {
-    fn init_tables() {
-        create_model::<Message>();
-        create_model::<Template>();
-        create_model::<BlockedSender>();
+    fn schema(s: &mut Schema) {
+        s.model::<Message>();
+        s.model::<Template>();
+        s.model::<BlockedSender>();
     }
 
     fn build_router() -> Router {
