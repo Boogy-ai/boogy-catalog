@@ -822,7 +822,7 @@ struct AdminSummary {
 /// breakdown), with an optional `from`/`to` (created_at epoch-ms) window.
 ///
 /// independent-reads: this aggregates the whole orders table in one full ordered
-/// walk (`allow_full_scan`). Bounded by the deployment's order count; a very
+/// walk. Bounded by the deployment's order count; a very
 /// high-volume deployment would precompute rollups instead. Acceptable for v1.
 fn admin_summary(req: &mut Req<'_>) -> Result<Json<AdminSummary>, ApiError> {
     require_owner()?;
@@ -834,7 +834,6 @@ fn admin_summary(req: &mut Req<'_>) -> Result<Json<AdminSummary>, ApiError> {
         q = q.where_lte(Order::CREATED_AT, to);
     }
     let rows = q
-        .allow_full_scan("operator summary aggregates the whole orders table")
         .fetch_all()?;
 
     let mut status_counts: Vec<(String, usize)> = Vec::new();
@@ -938,7 +937,6 @@ fn admin_list_clients(_req: &mut Req<'_>) -> Result<Json<Vec<ClientInfo>>, ApiEr
     require_owner()?;
 
     let order_rows = Query::on(Order::TABLE)
-        .allow_full_scan("operator client list aggregates the whole orders table")
         .fetch_all()?;
     let mut counts: Vec<(String, usize)> = Vec::new();
     for r in &order_rows {
@@ -950,7 +948,6 @@ fn admin_list_clients(_req: &mut Req<'_>) -> Result<Json<Vec<ClientInfo>>, ApiEr
     }
 
     let blocked: Vec<String> = Query::on(BlockedClient::TABLE)
-        .allow_full_scan("operator client list overlays the (small) block list")
         .fetch_all()?
         .iter()
         .map(|r| BlockedClient::from_row(r).client_service)

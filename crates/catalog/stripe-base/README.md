@@ -329,7 +329,7 @@ flowchart TD
     OW -->|yes| OWF["WHERE client_service = client"]
     OW -->|no| OWA["full ordered scan
     across all partitions
-    (allow_full_scan)"]
+    (whole-table read)"]
     CA --> Out["newest first → items[]"]
     OWF --> Out
     OWA --> Out
@@ -337,7 +337,8 @@ flowchart TD
 
 A client app's partition is pinned to its attested identity and any `?client=`
 query param is ignored — it can *never* read another app's orders. The owner walks
-all partitions (an explicit `allow_full_scan`, since the whole deployment is theirs).
+all partitions — a whole-table read, since the whole deployment is theirs. It is
+warned and metered rather than refused.
 
 ---
 

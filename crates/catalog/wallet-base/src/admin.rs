@@ -83,7 +83,6 @@ fn admin_wallet_out(r: &crate::Row) -> AdminWalletOut {
 pub fn admin_list_wallets(_req: &mut Req<'_>) -> Result<Json<Vec<AdminWalletOut>>, ApiError> {
     require_owner()?;
     let rows = Query::on(Wallet::TABLE)
-        .allow_full_scan("operator lists all wallets")
         .fetch_all()?;
     Ok(Json(rows.iter().map(admin_wallet_out).collect()))
 }
@@ -130,8 +129,7 @@ pub fn admin_list_transactions(
     req: &mut Req<'_>,
 ) -> Result<Json<Vec<AdminTxOut>>, ApiError> {
     require_owner()?;
-    let mut q = Query::on(Transaction::TABLE)
-        .allow_full_scan("operator lists all transactions");
+    let mut q = Query::on(Transaction::TABLE);
 
     if let Some(status) = req.query("status").filter(|s| !s.is_empty()) {
         q = q.where_eq(Transaction::STATUS, status);
