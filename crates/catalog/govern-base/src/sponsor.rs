@@ -1,14 +1,13 @@
 //! Co-sponsorship handler + sponsorship-threshold → voting transition.
 
 use boogy_sdk::model::{Id, Model, Timestamp};
-use boogy_sdk::store::Val;
 use govern_base_core::ProposalStatus;
 
 use crate::admin::load_config;
 use crate::models::{Proposal, Sponsorship};
 use crate::proposals::{proposal_out, ProposalOut};
 use crate::{
-    db_find_by, db_insert, db_update, get_row, now_ms, require_voter, tx, Json, Req, ApiError,
+    db_insert, db_update, get_row, now_ms, require_voter, tx, Json, Req, ApiError,
 };
 
 /// `POST /proposals/{id}/sponsor` — an eligible principal endorses a proposal in
@@ -35,11 +34,24 @@ pub fn sponsor_proposal(req: &mut Req<'_>) -> Result<Json<ProposalOut>, ApiError
         }
 
         // Idempotent: already sponsored → return current state unchanged.
-        let existing: Vec<Sponsorship> =
-            db_find_by::<Sponsorship>(Sponsorship::PROPOSAL_ID, Val::Integer(id as i64))?;
-        if existing.iter().any(|s| s.principal == principal) {
+        //
+        // Two counts, not one listing. This used to read every sponsorship on
+        // the proposal into a `Vec` and then ask two questions of it — "is this
+        // principal in there" and "how many are there" — so the cost of adding
+        // the Nth sponsor grew with N. Both questions are numbers the store can
+        // answer without materializing a row.
+        let already_sponsored = crate::Query::on(Sponsorship::TABLE)
+            .filter(Sponsorship::proposal_id.eq(id as i64))
+            .filter(Sponsorship::principal.eq(principal.clone()))
+            .count()?;
+        if already_sponsored > 0 {
             return Ok(proposal_out(&p));
         }
+        // Counted BEFORE the insert below, matching what the drained listing
+        // measured — the `+ 1` is this new sponsor.
+        let sponsors_before = crate::Query::on(Sponsorship::TABLE)
+            .filter(Sponsorship::proposal_id.eq(id as i64))
+            .count()?;
 
         db_insert(&Sponsorship {
             id: Id::new(0),
@@ -48,7 +60,7 @@ pub fn sponsor_proposal(req: &mut Req<'_>) -> Result<Json<ProposalOut>, ApiError
             principal: principal.clone(),
             created_at: Timestamp::new(now),
         })?;
-        p.sponsor_count = existing.len() as i64 + 1;
+        p.sponsor_count = sponsors_before as i64 + 1;
 
         if p.sponsor_count >= p.sponsorship_threshold {
             // HD-7: clamp to minimum voting period floor.

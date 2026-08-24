@@ -2,7 +2,7 @@
 
 use boogy_sdk::model::{Id, Model, Timestamp};
 use boogy_sdk::pagination::CursorPage;
-use boogy_sdk::store::{SortDir, Val};
+use boogy_sdk::store::Val;
 use govern_base_core::ProposalStatus;
 
 use crate::models::{AdminAudit, Config, Member, Proposal};
@@ -358,7 +358,7 @@ pub fn list_members(req: &mut Req<'_>) -> Result<Json<CursorPage<MemberOut>>, Ap
     require_owner()?;
     let (limit, cursor) = page_params(req);
     let page = crate::Query::on(Member::TABLE)
-        .keyset_by(Member::ADDED_AT, SortDir::Desc)
+        .order(Member::added_at.desc())
         .limit(limit)
         .cursor(cursor)
         .fetch_page(|r| member_out(&Member::from_row(r)))?;
@@ -371,10 +371,10 @@ pub fn list_audit(req: &mut Req<'_>) -> Result<Json<CursorPage<AuditOut>>, ApiEr
     let (limit, cursor) = page_params(req);
     let mut q = crate::Query::on(AdminAudit::TABLE);
     if let Some(a) = req.query("action").filter(|s| !s.is_empty()) {
-        q = q.where_eq(AdminAudit::ACTION, a);
+        q = q.filter(AdminAudit::action.eq(a));
     }
     let page = q
-        .keyset_by(AdminAudit::AT, SortDir::Desc)
+        .order(AdminAudit::at.desc())
         .limit(limit)
         .cursor(cursor)
         .fetch_page(|r| {

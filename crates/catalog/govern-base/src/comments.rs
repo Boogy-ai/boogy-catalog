@@ -2,7 +2,6 @@
 
 use boogy_sdk::model::{Id, Model, Timestamp};
 use boogy_sdk::pagination::CursorPage;
-use boogy_sdk::store::SortDir;
 
 use crate::models::{Comment, Proposal};
 use crate::{
@@ -69,9 +68,9 @@ pub fn list_comments(req: &mut Req<'_>) -> Result<Json<CursorPage<CommentOut>>, 
     let id: u64 = req.params.get("id").unwrap_or("0").parse().unwrap_or(0);
     let (limit, cursor) = page_params(req);
     let page = crate::Query::on(Comment::TABLE)
-        .where_eq(Comment::PROPOSAL_ID, id as i64)
-        .where_eq(Comment::HIDDEN, false)
-        .keyset_by(Comment::CREATED_AT, SortDir::Asc)
+        .filter(Comment::proposal_id.eq(id as i64))
+        .filter(Comment::hidden.eq(false))
+        .order(Comment::created_at.asc())
         .limit(limit)
         .cursor(cursor)
         .fetch_page(|r| comment_out(&Comment::from_row(r)))?;

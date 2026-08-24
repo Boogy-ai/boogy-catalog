@@ -136,8 +136,8 @@ pub struct BtcFeesOut {
 /// the same compressed key at wallet creation.
 fn require_wallet(principal: &str) -> Result<Wallet, ApiError> {
     let row = Query::on(Wallet::TABLE)
-        .where_eq(Wallet::OWNER_PRINCIPAL, principal)
-        .where_eq(Wallet::CHAIN, BTC_CHAIN)
+        .filter(Wallet::owner_principal.eq(principal))
+        .filter(Wallet::chain.eq(BTC_CHAIN))
         .fetch_one()?
         .ok_or_else(|| ApiError::bad_request("no btc wallet; create one first"))?;
     Ok(Wallet::from_row(&row))

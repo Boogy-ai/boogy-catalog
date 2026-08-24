@@ -47,7 +47,6 @@ use rpc_client::call_evm_rpc;
 
 use boogy_sdk::jobs::JobSpec;
 use boogy_sdk::model::{Id, Model, Timestamp};
-use boogy_sdk::pagination::decode;
 use boogy_sdk::signing::SigAlg;
 use boogy_sdk::{schema_decl::Schema, Api, JobRouter};
 use wallet_base_core::btc::{BtcAdapter, BtcNetwork};
@@ -343,14 +342,17 @@ impl Api for WalletBase {
             // ── Operator admin surface (/admin/*; owner-only) ─────────────────
             .summary("List all wallets (operator)")
             .description(
-                "Operator view of all wallets across all principals. \
-                 Requires the service owner's agent token.",
+                "Operator view of wallets across all principals, newest-first. \
+                 Keyset-paginated: `?limit` (clamped) and `?cursor`, returning \
+                 {items, next_cursor}. Requires the service owner's agent token.",
             )
             .get("/admin/wallets", admin::admin_list_wallets)
             .summary("List all transactions (operator)")
             .description(
-                "Operator view of all transactions across all principals. \
-                 Optional `?status=` and `?owner=` residual filters.",
+                "Operator view of transactions across all principals, \
+                 newest-first. Keyset-paginated: `?limit` (clamped) and \
+                 `?cursor`, returning {items, next_cursor}. Optional `?status=` \
+                 and `?owner=` filters.",
             )
             .get("/admin/transactions", admin::admin_list_transactions)
             .summary("Get a principal's EVM policy (operator)")
@@ -494,8 +496,8 @@ pub(crate) fn do_ensure_wallet(principal: &str, chain: &str) -> Result<WalletOut
 
     // Idempotent: an existing wallet for this (principal, chain) wins.
     if let Some(row) = Query::on(Wallet::TABLE)
-        .where_eq(Wallet::OWNER_PRINCIPAL, principal)
-        .where_eq(Wallet::CHAIN, chain)
+        .filter(Wallet::owner_principal.eq(principal))
+        .filter(Wallet::chain.eq(chain))
         .fetch_one()?
     {
         let w = Wallet::from_row(&row);
@@ -561,17 +563,38 @@ fn ensure_wallet(Json(body): Json<EnsureWalletReq>) -> Result<Json<WalletOut>, A
     do_ensure_wallet(&p, &body.chain).map(Json)
 }
 
-/// `GET /wallets` — list the caller's wallets across all chains.
-fn list_wallets(_req: &mut Req<'_>) -> Result<Json<Vec<WalletOut>>, ApiError> {
-    let rows = auth::find_owned::<Wallet>(Wallet::OWNER_PRINCIPAL)?;
-    let out = rows
-        .iter()
-        .map(|r| {
-            let w = Wallet::from_row(r);
-            WalletOut { chain: w.chain, address: w.address }
-        })
-        .collect();
-    Ok(Json(out))
+/// Query parameters for a paginated listing.
+///
+/// `limit` is a hint: the platform clamps it. There is no value that means
+/// "everything" — a listing endpoint that could be asked for a whole table is
+/// one bad tenant away from exhausting the guest heap.
+#[derive(Deserialize, schemars::JsonSchema)]
+struct ListQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Opaque token from a previous response's `next_cursor`.
+    #[serde(default)]
+    cursor: Option<String>,
+}
+
+/// `GET /wallets` — one page of the caller's wallets, newest first.
+///
+/// Paginated even though a wallet-per-chain set is small today: the bound is a
+/// property of the endpoint, not a guess about how much data this particular
+/// tenant will accumulate. Guessing is what produced the listing that trapped.
+fn list_wallets(req: &mut Req<'_>) -> Result<Json<boogy_sdk::pagination::CursorPage<WalletOut>>, ApiError> {
+    let q: ListQuery = req.parse_query_raw()?;
+    let page = auth::find_owned::<Wallet>(
+        Wallet::OWNER_PRINCIPAL,
+        &boogy_sdk::pagination::PageRequest::new(
+            q.limit.unwrap_or(boogy_sdk::pagination::DEFAULT_PAGE_LIMIT),
+            q.cursor,
+        ),
+    )?;
+    Ok(Json(page.map(|r| {
+        let w = Wallet::from_row(r);
+        WalletOut { chain: w.chain, address: w.address }
+    })))
 }
 
 /// `GET /wallets/{chain}` — the caller's wallet for one chain (404-masked).
@@ -580,8 +603,8 @@ fn get_wallet(req: &mut Req<'_>) -> Result<Json<WalletOut>, ApiError> {
     let chain = req.params.get("chain").unwrap_or_default().to_string();
 
     let row = Query::on(Wallet::TABLE)
-        .where_eq(Wallet::OWNER_PRINCIPAL, p.as_str())
-        .where_eq(Wallet::CHAIN, chain.as_str())
+        .filter(Wallet::owner_principal.eq(p.as_str()))
+        .filter(Wallet::chain.eq(chain.as_str()))
         .fetch_one()?
         .ok_or_else(ApiError::not_found)?;
 
@@ -616,8 +639,8 @@ fn evm_sign(Json(body): Json<EvmIntentReq>) -> Result<Json<SignOut>, ApiError> {
     // Local key cache: require the wallet row before touching the signer. A
     // missing row → the key was never created for this principal.
     let wallet_row = Query::on(Wallet::TABLE)
-        .where_eq(Wallet::OWNER_PRINCIPAL, p.as_str())
-        .where_eq(Wallet::CHAIN, "evm")
+        .filter(Wallet::owner_principal.eq(p.as_str()))
+        .filter(Wallet::chain.eq("evm"))
         .fetch_one()?
         .ok_or_else(|| ApiError::bad_request("no evm wallet; create one first"))?;
     let wallet = Wallet::from_row(&wallet_row);
@@ -773,8 +796,8 @@ pub(crate) fn do_simulate(principal: &str, body: EvmIntentReq) -> Result<SimOut,
 
     // Resolve the caller's EVM wallet address so estimateGas uses the correct sender.
     let wallet_row = Query::on(Wallet::TABLE)
-        .where_eq(Wallet::OWNER_PRINCIPAL, principal)
-        .where_eq(Wallet::CHAIN, "evm")
+        .filter(Wallet::owner_principal.eq(principal))
+        .filter(Wallet::chain.eq("evm"))
         .fetch_one()?
         .ok_or_else(|| ApiError::bad_request("no evm wallet; create one first"))?;
     let from_addr = Wallet::from_row(&wallet_row).address;
@@ -951,8 +974,8 @@ pub(crate) fn load_policy(
     chain: &str,
 ) -> Result<Option<WalletPolicy>, ApiError> {
     Ok(Query::on(WalletPolicy::TABLE)
-        .where_eq(WalletPolicy::OWNER_PRINCIPAL, principal)
-        .where_eq(WalletPolicy::CHAIN, chain)
+        .filter(WalletPolicy::owner_principal.eq(principal))
+        .filter(WalletPolicy::chain.eq(chain))
         .fetch_one()?
         .map(|r| WalletPolicy::from_row(&r)))
 }
@@ -1180,8 +1203,8 @@ pub(crate) fn do_send(principal: &str, body: EvmIntentReq) -> Result<SendOut, Ap
 
     // Require the caller's EVM wallet (the local key cache).
     let wallet_row = Query::on(Wallet::TABLE)
-        .where_eq(Wallet::OWNER_PRINCIPAL, principal)
-        .where_eq(Wallet::CHAIN, EVM_CHAIN)
+        .filter(Wallet::owner_principal.eq(principal))
+        .filter(Wallet::chain.eq(EVM_CHAIN))
         .fetch_one()?
         .ok_or_else(|| ApiError::bad_request("no evm wallet; create one first"))?;
     let wallet = Wallet::from_row(&wallet_row);
@@ -1390,13 +1413,13 @@ fn evm_send(Json(body): Json<EvmIntentReq>) -> Result<Json<SendOut>, ApiError> {
 
 /// Keyset-pagination helper: parse `?limit=` (default 50, clamped 1..=200) and
 /// `?cursor=` from the request's query string.
-pub(crate) fn page_params(req: &mut Req<'_>) -> (usize, Option<boogy_sdk::pagination::Cursor>) {
+pub(crate) fn page_params(req: &mut Req<'_>) -> (usize, Option<String>) {
     let limit = req
         .query("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(50)
         .clamp(1, 200);
-    let cursor = req.query("cursor").and_then(decode);
+    let cursor = req.query("cursor").map(str::to_string);
     (limit, cursor)
 }
 
@@ -1407,12 +1430,11 @@ pub(crate) fn do_list_transactions(
     chain: &str,
     limit: usize,
 ) -> Result<Vec<mcp::TxItem>, ApiError> {
-    use boogy_sdk::store::SortDir;
 
     let rows = Query::on(Transaction::TABLE)
-        .where_eq(Transaction::OWNER_PRINCIPAL, principal)
-        .where_eq(Transaction::CHAIN, chain)
-        .keyset_by(Transaction::CREATED_AT, SortDir::Desc)
+        .filter(Transaction::owner_principal.eq(principal))
+        .filter(Transaction::chain.eq(chain))
+        .order(Transaction::created_at.desc())
         .limit(limit)
         .fetch_all()?;
 
@@ -1495,9 +1517,9 @@ pub(crate) fn load_daily_spend(
     now_secs: i64,
 ) -> Result<Option<DailySpend>, ApiError> {
     let row = Query::on(DailySpend::TABLE)
-        .where_eq(DailySpend::OWNER_PRINCIPAL, principal)
-        .where_eq(DailySpend::CHAIN, chain)
-        .where_eq(DailySpend::DENOM, denom)
+        .filter(DailySpend::owner_principal.eq(principal))
+        .filter(DailySpend::chain.eq(chain))
+        .filter(DailySpend::denom.eq(denom))
         .fetch_one()?;
     let Some(row) = row else { return Ok(None) };
     let d = DailySpend::from_row(&row);
@@ -1549,9 +1571,9 @@ pub(crate) fn upsert_daily_spend(
         .ok_or_else(|| ApiError::bad_request("value + fee overflow"))?;
 
     let existing = Query::on(DailySpend::TABLE)
-        .where_eq(DailySpend::OWNER_PRINCIPAL, principal)
-        .where_eq(DailySpend::CHAIN, chain)
-        .where_eq(DailySpend::DENOM, denom)
+        .filter(DailySpend::owner_principal.eq(principal))
+        .filter(DailySpend::chain.eq(chain))
+        .filter(DailySpend::denom.eq(denom))
         .fetch_one()?
         .map(|r| DailySpend::from_row(&r));
 
@@ -1608,8 +1630,8 @@ pub(crate) fn reserve_nonce(
         // branches are mutually exclusive (exactly one runs). The read + write
         // are atomic within this `tx`; concurrent reservers conflict on the row.
         let existing = Query::on(NonceReservation::TABLE)
-            .where_eq(NonceReservation::OWNER_PRINCIPAL, principal)
-            .where_eq(NonceReservation::CHAIN, chain)
+            .filter(NonceReservation::owner_principal.eq(principal))
+            .filter(NonceReservation::chain.eq(chain))
             .fetch_one()?
             .map(|r| NonceReservation::from_row(&r));
         let stored_next = existing.as_ref().map(|n| n.next_nonce.max(0) as u64).unwrap_or(0);

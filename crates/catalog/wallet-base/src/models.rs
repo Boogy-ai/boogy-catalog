@@ -10,7 +10,7 @@
 //! `#[derive(Model)]` attribute supports `lookup_by` for single-column point
 //! lookups only — no composite `lookup_by` attribute exists.  We therefore
 //! put `#[index]` on `owner_principal` (the primary equality-seek axis) and
-//! enforce the pair uniqueness in the handler via a residual `.where_eq(chain)`
+//! enforce the pair uniqueness in the handler via a residual `.filter(chain.eq(..))`
 //! filter at query time before insert.  This is an application-level uniqueness
 //! check, not a storage-level constraint; concurrent inserts are prevented by
 //! the caller holding a transaction.
@@ -27,8 +27,16 @@ use boogy_sdk::Model;
 /// - For the one-wallet-per-`(owner_principal, chain)` invariant, handlers
 ///   check `where_eq(chain)` after filtering by `owner_principal` before
 ///   inserting (see module-level note above).
+/// - `ranked_by(highest = "created_at")` backs the operator's UNFILTERED
+///   newest-first wallet list (`GET /admin/wallets`). Without it that listing
+///   has no covering ordered index and no cursor key, so it could only be
+///   served by reading the table.
 #[derive(Model)]
-#[model(table = "wallets", list_by(filter = "owner_principal", newest = "created_at"))]
+#[model(
+    table = "wallets",
+    list_by(filter = "owner_principal", newest = "created_at"),
+    ranked_by(highest = "created_at")
+)]
 pub struct Wallet {
     #[pk]
     pub id: Id<Wallet>,
@@ -48,12 +56,17 @@ pub struct Wallet {
 ///   confirmation polling and webhook deduplication.
 /// - `list_by(filter = "owner_principal", newest = "created_at")` backs
 ///   the keyset-paginated transaction history newest-first.
+/// - `list_by(filter = "status", newest = "created_at")` backs the operator's
+///   `?status=` filter, and `ranked_by(highest = "created_at")` its unfiltered
+///   newest-first list — both keyset-paginated, neither served by a scan.
 /// - `value_wei` and `fee_wei` are decimal strings (u256-safe).
 /// - `status` is one of `signed | pending | confirmed | failed`.
 #[derive(Model)]
 #[model(
     table = "transactions",
-    list_by(filter = "owner_principal", newest = "created_at")
+    list_by(filter = "owner_principal", newest = "created_at"),
+    list_by(filter = "status", newest = "created_at"),
+    ranked_by(highest = "created_at")
 )]
 pub struct Transaction {
     #[pk]

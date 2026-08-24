@@ -2,7 +2,6 @@
 
 use boogy_sdk::model::{Id, Model, Timestamp};
 use boogy_sdk::pagination::CursorPage;
-use boogy_sdk::store::SortDir;
 use govern_base_core::{validate_action, ActionSpec, ProposalStatus};
 
 use crate::admin::load_config;
@@ -126,8 +125,8 @@ pub fn create_proposal(
     // HD-8: per-author proposal rate limit — checked BEFORE the insert tx.
     if cfg.author_cooldown_ms > 0 {
         let recent_rows = crate::Query::on(Proposal::TABLE)
-            .where_eq(Proposal::AUTHOR, principal.as_str())
-            .keyset_by(Proposal::CREATED_AT, SortDir::Desc)
+            .filter(Proposal::author.eq(principal.as_str()))
+            .order(Proposal::created_at.desc())
             .limit(1)
             .fetch_all()?;
         if let Some(row) = recent_rows.into_iter().next() {
@@ -218,13 +217,13 @@ pub fn list_proposals(req: &mut Req<'_>) -> Result<Json<CursorPage<ProposalOut>>
     let (limit, cursor) = page_params(req);
     let mut q = crate::Query::on(Proposal::TABLE);
     if let Some(s) = req.query("status").filter(|s| !s.is_empty()) {
-        q = q.where_eq(Proposal::STATUS, s);
+        q = q.filter(Proposal::status.eq(s));
     }
     if let Some(a) = req.query("author").filter(|s| !s.is_empty()) {
-        q = q.where_eq(Proposal::AUTHOR, a);
+        q = q.filter(Proposal::author.eq(a));
     }
     let page = q
-        .keyset_by(Proposal::CREATED_AT, SortDir::Desc)
+        .order(Proposal::created_at.desc())
         .limit(limit)
         .cursor(cursor)
         .fetch_page(|r| proposal_out(&Proposal::from_row(r)))?;

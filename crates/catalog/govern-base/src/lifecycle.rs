@@ -6,7 +6,6 @@
 //! periodic `lifecycle_tick` sweep, so a tally is never stale when observed.
 
 use boogy_sdk::model::{Model, Timestamp};
-use boogy_sdk::store::SortDir;
 use govern_base_core::{decide, Electorate, Outcome, ProposalStatus, TallyParams};
 
 use crate::admin::frac;
@@ -105,8 +104,8 @@ fn finalize_vote(id: u64) -> Result<String, ApiError> {
 pub fn sweep() -> Result<(), ApiError> {
     for state in [ProposalStatus::Voting, ProposalStatus::Timelock] {
         let rows = crate::Query::on(Proposal::TABLE)
-            .where_eq(Proposal::STATUS, state.as_str())
-            .keyset_by(Proposal::CREATED_AT, SortDir::Asc)
+            .filter(Proposal::status.eq(state.as_str()))
+            .order(Proposal::created_at.asc())
             .limit(200)
             .fetch_all()?;
         for r in rows {

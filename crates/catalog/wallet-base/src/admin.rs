@@ -5,8 +5,8 @@
 //! flag. Mirrors stripe-base's admin pattern exactly.
 //!
 //! Routes:
-//! - `GET  /admin/wallets`                — all wallets across all principals
-//! - `GET  /admin/transactions`           — all transactions; `?status=` / `?owner=`
+//! - `GET  /admin/wallets`                — wallets across all principals, paginated
+//! - `GET  /admin/transactions`           — transactions, paginated; `?status=` / `?owner=`
 //! - `GET  /admin/policy/{principal}`     — view guardrails for a principal
 //! - `PUT  /admin/policy/{principal}`     — set guardrails for a principal
 //! - `POST /admin/block/{principal}`      — block a principal
@@ -15,7 +15,7 @@
 
 use boogy_sdk::model::{Id, Model, Timestamp};
 use boogy_sdk::pagination::CursorPage;
-use boogy_sdk::store::{SortDir, Val};
+use boogy_sdk::store::Val;
 
 use crate::models::{AdminAudit, BlockedPrincipal, Transaction, Wallet, WalletPolicy};
 use serde::{Deserialize, Serialize};
@@ -79,12 +79,21 @@ fn admin_wallet_out(r: &crate::Row) -> AdminWalletOut {
     }
 }
 
-/// Operator: all wallets across all principals.
-pub fn admin_list_wallets(_req: &mut Req<'_>) -> Result<Json<Vec<AdminWalletOut>>, ApiError> {
+/// Operator: wallets across all principals, newest-first, keyset-paginated.
+///
+/// This returned EVERY wallet in the deployment with no bound — which in
+/// practice meant whatever page the store chose to return, with no cursor and
+/// no total, so an operator could not tell a complete list from a truncated
+/// one. It now serves one page and hands back the token that continues it.
+pub fn admin_list_wallets(req: &mut Req<'_>) -> Result<Json<CursorPage<AdminWalletOut>>, ApiError> {
     require_owner()?;
-    let rows = Query::on(Wallet::TABLE)
-        .fetch_all()?;
-    Ok(Json(rows.iter().map(admin_wallet_out).collect()))
+    let (limit, cursor) = page_params(req);
+    let page = Query::on(Wallet::TABLE)
+        .order(Wallet::created_at.desc())
+        .limit(limit)
+        .cursor(cursor)
+        .fetch_page(admin_wallet_out)?;
+    Ok(Json(page))
 }
 
 // ─── Operator transaction list ────────────────────────────────────────────────
@@ -124,22 +133,31 @@ fn admin_tx_out(r: &crate::Row) -> AdminTxOut {
     }
 }
 
-/// Operator: all transactions; optional `?status=` and `?owner=` residual filters.
+/// Operator: transactions newest-first, keyset-paginated; optional `?status=`
+/// and `?owner=` filters.
+///
+/// Same correction as `admin_list_wallets`: this read had no bound, so the
+/// operator's view of a busy deployment was a silently truncated prefix.
 pub fn admin_list_transactions(
     req: &mut Req<'_>,
-) -> Result<Json<Vec<AdminTxOut>>, ApiError> {
+) -> Result<Json<CursorPage<AdminTxOut>>, ApiError> {
     require_owner()?;
+    let (limit, cursor) = page_params(req);
     let mut q = Query::on(Transaction::TABLE);
 
     if let Some(status) = req.query("status").filter(|s| !s.is_empty()) {
-        q = q.where_eq(Transaction::STATUS, status);
+        q = q.filter(Transaction::status.eq(status));
     }
     if let Some(owner) = req.query("owner").filter(|s| !s.is_empty()) {
-        q = q.where_eq(Transaction::OWNER_PRINCIPAL, owner);
+        q = q.filter(Transaction::owner_principal.eq(owner));
     }
 
-    let rows = q.fetch_all()?;
-    Ok(Json(rows.iter().map(admin_tx_out).collect()))
+    let page = q
+        .order(Transaction::created_at.desc())
+        .limit(limit)
+        .cursor(cursor)
+        .fetch_page(admin_tx_out)?;
+    Ok(Json(page))
 }
 
 // ─── Operator policy view/set ─────────────────────────────────────────────────
@@ -153,8 +171,8 @@ pub fn admin_get_policy(req: &mut Req<'_>) -> Result<Json<PolicyReq>, ApiError> 
     }
 
     let row = Query::on(WalletPolicy::TABLE)
-        .where_eq(WalletPolicy::OWNER_PRINCIPAL, principal.as_str())
-        .where_eq(WalletPolicy::CHAIN, EVM_CHAIN)
+        .filter(WalletPolicy::owner_principal.eq(principal.as_str()))
+        .filter(WalletPolicy::chain.eq(EVM_CHAIN))
         .fetch_one()?
         .map(|r| WalletPolicy::from_row(&r));
 
@@ -184,8 +202,8 @@ pub fn admin_put_policy(req: &mut Req<'_>) -> Result<Json<PolicyReq>, ApiError> 
     let now = Timestamp::new(now_millis() as i64);
 
     let existing = Query::on(WalletPolicy::TABLE)
-        .where_eq(WalletPolicy::OWNER_PRINCIPAL, principal.as_str())
-        .where_eq(WalletPolicy::CHAIN, EVM_CHAIN)
+        .filter(WalletPolicy::owner_principal.eq(principal.as_str()))
+        .filter(WalletPolicy::chain.eq(EVM_CHAIN))
         .fetch_one()?
         .map(|r| WalletPolicy::from_row(&r));
 
@@ -220,8 +238,8 @@ pub fn admin_put_policy(req: &mut Req<'_>) -> Result<Json<PolicyReq>, ApiError> 
     write_admin_audit("policy.set", Some(&principal), None);
 
     let result = Query::on(WalletPolicy::TABLE)
-        .where_eq(WalletPolicy::OWNER_PRINCIPAL, principal.as_str())
-        .where_eq(WalletPolicy::CHAIN, EVM_CHAIN)
+        .filter(WalletPolicy::owner_principal.eq(principal.as_str()))
+        .filter(WalletPolicy::chain.eq(EVM_CHAIN))
         .fetch_one()?
         .map(|r| WalletPolicy::from_row(&r));
     Ok(Json(result.as_ref().map(PolicyReq::from).unwrap_or_default()))
@@ -356,10 +374,10 @@ pub fn admin_list_audit(req: &mut Req<'_>) -> Result<Json<CursorPage<AuditOut>>,
     let (limit, cursor) = page_params(req);
     let mut q = Query::on(AdminAudit::TABLE);
     if let Some(action) = req.query("action").filter(|s| !s.is_empty()) {
-        q = q.where_eq(AdminAudit::ACTION, action);
+        q = q.filter(AdminAudit::action.eq(action));
     }
     let page = q
-        .keyset_by(AdminAudit::AT, SortDir::Desc)
+        .order(AdminAudit::at.desc())
         .limit(limit)
         .cursor(cursor)
         .fetch_page(audit_out)?;

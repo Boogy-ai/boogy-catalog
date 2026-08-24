@@ -56,7 +56,7 @@ use boogy_sdk::Model;
 ///
 /// Every listing is keyset-paginated newest-first by `created_at`. The model
 /// declares the covering composite indexes that back those walks, so a
-/// `where_eq(<filter>).keyset_by("created_at", Desc).fetch_page(...)` is an
+/// `.filter(<predicate>).order(M::created_at.desc()).fetch_page(...)` is an
 /// index walk, never a scan:
 /// - `list_by(filter = "client_service", …)` — a client app's own orders, and
 ///   the admin `?client=` filter. Its prefix also serves the plain
@@ -65,13 +65,21 @@ use boogy_sdk::Model;
 /// - `list_by(filter = "status", …)` — the admin `?status=` filter.
 /// - `ranked_by(highest = "created_at")` — the owner's unfiltered, all-apps
 ///   newest-first feed (no filter column).
+/// - `rollup(group = "client_service")` — the admin client roster's per-app
+///   order tally. An INDEX on the grouping column cannot serve this: leading
+///   with `client_service` makes the groups contiguous, not fewer, so an
+///   unfiltered `GROUP BY client_service` still reads every order. The rollup
+///   maintains the per-group count on the write, which is what makes that
+///   read cost the number of client apps rather than the number of orders.
+///   It counts only — no `sum`, because the query totals no column.
 #[derive(Model)]
 #[model(
     table = "orders",
     list_by(filter = "client_service", newest = "created_at"),
     list_by(filter = "customer_ref", newest = "created_at"),
     list_by(filter = "status", newest = "created_at"),
-    ranked_by(highest = "created_at")
+    ranked_by(highest = "created_at"),
+    rollup(group = "client_service")
 )]
 pub struct Order {
     #[pk]

@@ -3,7 +3,6 @@
 
 use boogy_sdk::mcp::{tool, McpServer};
 use boogy_sdk::model::Model;
-use boogy_sdk::store::SortDir;
 
 use crate::models::Proposal;
 use crate::proposals::{proposal_out, ProposalOut};
@@ -27,10 +26,10 @@ fn list_proposals_tool(args: ListArgs) -> Result<ListResult, crate::ApiError> {
     crate::gate_read()?;
     let mut q = crate::Query::on(Proposal::TABLE);
     if let Some(s) = args.status.filter(|s| !s.is_empty()) {
-        q = q.where_eq(Proposal::STATUS, s);
+        q = q.filter(Proposal::status.eq(s));
     }
     let rows = q
-        .keyset_by(Proposal::CREATED_AT, SortDir::Desc)
+        .order(Proposal::created_at.desc())
         .limit(50)
         .fetch_all()?;
     Ok(ListResult {

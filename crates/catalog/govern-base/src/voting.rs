@@ -2,11 +2,11 @@
 
 use boogy_sdk::model::{Id, Model, Timestamp};
 use boogy_sdk::store::Val;
-use govern_base_core::{tally_votes, Tally, VoteOption};
+use govern_base_core::{Tally, VoteOption};
 
 use crate::models::{Proposal, Vote};
 use crate::{
-    db_find_by, db_insert, get_row, now_ms, require_voter, tx, Deserialize, Json, Req,
+    db_insert, get_row, now_ms, require_voter, tx, Deserialize, Json, Req,
     Serialize, ApiError,
 };
 
@@ -23,15 +23,52 @@ pub struct VoteAck {
     pub option: String,
 }
 
+/// How many vote-option groups the tally will materialize.
+///
+/// `group_by(option)` yields one item per DISTINCT option value, and the
+/// options a ballot may carry are a closed set (`yes` / `no` / `abstain` /
+/// `veto`). Spare slots so a value written by an older or newer version of this
+/// service is returned and skipped rather than silently cutting the tally
+/// short.
+const MAX_VOTE_OPTIONS: usize = 16;
+
 /// Aggregate all ballots for a proposal into a [`Tally`] (1p1v: weight 1).
+///
+/// The fold happens in the STORE, not in this component. It used to read every
+/// ballot row for the proposal into a `Vec` and count them here — one `Vec<Vote>`
+/// per tally, growing with turnout, in a 32 MiB guest heap. What comes back now
+/// is one row per option, whatever the turnout, and the platform pays for the
+/// walk that produces it.
 pub fn aggregate(proposal_id: u64) -> Result<Tally, ApiError> {
-    let votes: Vec<Vote> =
-        db_find_by::<Vote>(Vote::PROPOSAL_ID, Val::Integer(proposal_id as i64))?;
-    let pairs: Vec<(VoteOption, i64)> = votes
-        .iter()
-        .filter_map(|v| VoteOption::from_str(&v.option).map(|o| (o, v.weight)))
-        .collect();
-    Ok(tally_votes(&pairs))
+    let groups: Vec<(String, i64, i64)> = crate::Query::on(Vote::TABLE)
+        .filter(Vote::proposal_id.eq(proposal_id as i64))
+        .group_by(Vote::OPTION)
+        .sum(Vote::WEIGHT)
+        .count_all()
+        .limit(MAX_VOTE_OPTIONS)
+        .fetch_groups(|g| {
+            (
+                g.key().map(Val::as_text).unwrap_or_default(),
+                g.sum(Vote::WEIGHT).unwrap_or(0),
+                g.count_all(),
+            )
+        })?;
+
+    // An option this build does not recognise contributes NOTHING — neither
+    // weight nor a ballot — which is exactly what the row-by-row version did
+    // (its `filter_map` dropped the pair before `tally_votes` counted it).
+    let mut t = Tally::default();
+    for (option, weight, ballots) in groups {
+        match VoteOption::from_str(&option) {
+            Some(VoteOption::Yes) => t.yes += weight,
+            Some(VoteOption::No) => t.no += weight,
+            Some(VoteOption::Abstain) => t.abstain += weight,
+            Some(VoteOption::Veto) => t.veto += weight,
+            None => continue,
+        }
+        t.ballots += ballots;
+    }
+    Ok(t)
 }
 
 /// Cast a ballot. Phase 1 is single-cast: a second ballot from the same voter is
@@ -55,9 +92,15 @@ pub fn cast_vote(req: &mut Req<'_>) -> Result<Json<VoteAck>, ApiError> {
         if now >= p.voting_end {
             return Err(ApiError::conflict("voting has closed"));
         }
-        let existing: Vec<Vote> =
-            db_find_by::<Vote>(Vote::PROPOSAL_ID, Val::Integer(id as i64))?;
-        if existing.iter().any(|v| v.voter == voter) {
+        // An existence probe, not a listing: this asks whether THIS voter has a
+        // ballot, so it is one predicate the store answers with a number. The
+        // previous form read every ballot on the proposal to find out, which
+        // made the cost of casting a vote grow with the votes already cast.
+        let already_voted = crate::Query::on(Vote::TABLE)
+            .filter(Vote::proposal_id.eq(id as i64))
+            .filter(Vote::voter.eq(voter.clone()))
+            .count()?;
+        if already_voted > 0 {
             return Err(ApiError::conflict("already voted"));
         }
         db_insert(&Vote {

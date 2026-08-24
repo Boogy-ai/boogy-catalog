@@ -46,8 +46,8 @@ boogy_sdk::wit_glue!(bindings, StripeBase, with_jobs);
 
 use boogy_sdk::jobs::JobSpec;
 use boogy_sdk::model::{Id, Model, Timestamp};
-use boogy_sdk::pagination::{decode, CursorPage};
-use boogy_sdk::store::{SortDir, Val};
+use boogy_sdk::pagination::{CursorPage};
+use boogy_sdk::store::Val;
 use boogy_sdk::{schema_decl::Schema, Api, JobRouter};
 
 use bindings::boogy::platform::outbound_http;
@@ -571,8 +571,8 @@ fn list_orders(req: &mut Req<'_>) -> Result<Json<CursorPage<OrderOut>>, ApiError
         // Client app: pinned to its attested partition, query param ignored.
         // Backed by `list_by(filter = "client_service", newest = "created_at")`.
         Audience::ClientApp(name) => Query::on(Order::TABLE)
-            .where_eq(Order::CLIENT_SERVICE, name.as_str())
-            .keyset_by(Order::CREATED_AT, SortDir::Desc)
+            .filter(Order::client_service.eq(name.as_str()))
+            .order(Order::created_at.desc())
             .limit(limit)
             .cursor(cursor)
             .fetch_page(|r| order_out(r))?,
@@ -582,9 +582,9 @@ fn list_orders(req: &mut Req<'_>) -> Result<Json<CursorPage<OrderOut>>, ApiError
         Audience::Owner => {
             let mut q = Query::on(Order::TABLE);
             if let Some(client) = req.query("client").filter(|s| !s.is_empty()) {
-                q = q.where_eq(Order::CLIENT_SERVICE, client);
+                q = q.filter(Order::client_service.eq(client));
             }
-            q.keyset_by(Order::CREATED_AT, SortDir::Desc)
+            q.order(Order::created_at.desc())
                 .limit(limit)
                 .cursor(cursor)
                 .fetch_page(|r| order_out(r))?
@@ -624,15 +624,15 @@ struct OrderOut {
 }
 
 /// Shared keyset-pagination params for every list endpoint: `?limit=` (default
-/// 50, clamped 1..=200) + an opaque `?cursor=` decoded back to a [`Cursor`]
+/// 50, clamped 1..=200) + an opaque `?cursor=` carried through as the opaque token it is
 /// (`None` on the first page or a malformed cursor — fail-soft to page one).
-fn page_params(req: &mut Req<'_>) -> (usize, Option<boogy_sdk::pagination::Cursor>) {
+fn page_params(req: &mut Req<'_>) -> (usize, Option<String>) {
     let limit = req
         .query("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(50)
         .clamp(1, 200);
-    let cursor = req.query("cursor").and_then(decode);
+    let cursor = req.query("cursor").map(str::to_string);
     (limit, cursor)
 }
 
@@ -762,22 +762,22 @@ fn admin_list_orders(req: &mut Req<'_>) -> Result<Json<CursorPage<AdminOrderOut>
 
     let mut q = Query::on(Order::TABLE);
     if let Some(c) = req.query("client").filter(|s| !s.is_empty()) {
-        q = q.where_eq(Order::CLIENT_SERVICE, c);
+        q = q.filter(Order::client_service.eq(c));
     }
     if let Some(c) = req.query("customer").filter(|s| !s.is_empty()) {
-        q = q.where_eq(Order::CUSTOMER_REF, c);
+        q = q.filter(Order::customer_ref.eq(c));
     }
     if let Some(s) = req.query("status").filter(|s| !s.is_empty()) {
-        q = q.where_eq(Order::STATUS, s);
+        q = q.filter(Order::status.eq(s));
     }
     if let Some(from) = req.query("from").and_then(|s| s.parse::<i64>().ok()) {
-        q = q.where_gte(Order::CREATED_AT, from);
+        q = q.filter(Order::created_at.gte(from));
     }
     if let Some(to) = req.query("to").and_then(|s| s.parse::<i64>().ok()) {
-        q = q.where_lte(Order::CREATED_AT, to);
+        q = q.filter(Order::created_at.lte(to));
     }
     let page = q
-        .keyset_by(Order::CREATED_AT, SortDir::Desc)
+        .order(Order::created_at.desc())
         .limit(limit)
         .cursor(cursor)
         .fetch_page(|r| admin_order_out(r))?;
@@ -821,70 +821,109 @@ struct AdminSummary {
 /// Operator: aggregate summary (counts by status, gross/refunded totals, per-app
 /// breakdown), with an optional `from`/`to` (created_at epoch-ms) window.
 ///
-/// independent-reads: this aggregates the whole orders table in one full ordered
-/// walk. Bounded by the deployment's order count; a very
-/// high-volume deployment would precompute rollups instead. Acceptable for v1.
+/// **Computed by the store, not folded in the guest.** This used to read every
+/// order row into the component and add them up, with no bound — so the answer
+/// was capped by whatever page the store chose to return and was silently wrong
+/// above it, and the memory it needed grew with the deployment's order count.
+/// A summary has no page to hand its caller, so the fix is not a bound: it is
+/// to stop materializing rows at all. Each figure below is one aggregate query
+/// whose result is per-GROUP, and the groups here are statuses and client apps
+/// — sets that do not grow with order volume.
 fn admin_summary(req: &mut Req<'_>) -> Result<Json<AdminSummary>, ApiError> {
     require_owner()?;
-    let mut q = Query::on(Order::TABLE);
-    if let Some(from) = req.query("from").and_then(|s| s.parse::<i64>().ok()) {
-        q = q.where_gte(Order::CREATED_AT, from);
-    }
-    if let Some(to) = req.query("to").and_then(|s| s.parse::<i64>().ok()) {
-        q = q.where_lte(Order::CREATED_AT, to);
-    }
-    let rows = q
-        .fetch_all()?;
+    let from = req.query("from").and_then(|s| s.parse::<i64>().ok());
+    let to = req.query("to").and_then(|s| s.parse::<i64>().ok());
 
-    let mut status_counts: Vec<(String, usize)> = Vec::new();
-    let mut client_stats: Vec<(String, usize, i64)> = Vec::new();
-    let mut total_paid_amount: i64 = 0;
-    let mut total_refunded: i64 = 0;
+    // Totals over the window: one group, whatever the row count.
+    let (total_orders, total_refunded) = orders_in_window(from, to)
+        .count_all()
+        .sum(Order::AMOUNT_REFUNDED)
+        .fetch_one_group()
+        .map(|g| (g.count_all() as usize, g.sum(Order::AMOUNT_REFUNDED).unwrap_or(0)))?;
 
-    for r in &rows {
-        let o = Order::from_row(r);
-        let paid = o.status == "paid" || o.status == "refunded";
-        if paid {
-            total_paid_amount += o.amount;
-        }
-        total_refunded += o.amount_refunded;
+    // Gross collected = SUM(amount) over the statuses that represent money
+    // taken. `paid` and `refunded` both did.
+    let total_paid_amount = orders_in_window(from, to)
+        .filter(Order::status.is_in(PAID_STATUSES))
+        .sum(Order::AMOUNT)
+        .fetch_one_group()
+        .map(|g| g.sum(Order::AMOUNT).unwrap_or(0))?;
 
-        match status_counts.iter_mut().find(|(s, _)| s == &o.status) {
-            Some((_, c)) => *c += 1,
-            None => status_counts.push((o.status.clone(), 1)),
-        }
-        match client_stats.iter_mut().find(|(c, _, _)| c == &o.client_service) {
-            Some((_, n, amt)) => {
-                *n += 1;
-                if paid {
-                    *amt += o.amount;
-                }
-            }
-            None => client_stats.push((
-                o.client_service.clone(),
-                1,
-                if paid { o.amount } else { 0 },
-            )),
+    // One item per DISTINCT STATUS. That set is closed — the four values
+    // `Order::status` may hold — so the bound is exact rather than generous.
+    let by_status = orders_in_window(from, to)
+        .group_by(Order::STATUS)
+        .count_all()
+        .limit(MAX_ORDER_STATUSES)
+        .fetch_groups(|g| StatusCount {
+            status: g.key().map(Val::as_text).unwrap_or_default(),
+            count: g.count_all() as usize,
+        })?;
+
+    // Per app: order count over every status, and gross over the paid ones.
+    // Two groupings rather than one because they range over different rows.
+    // One item per DISTINCT CLIENT APP. That set does not grow with order
+    // volume — but it does grow, with every app the operator onboards, so it
+    // needs a stated ceiling and not the observation that it grows slowly.
+    let mut by_client: Vec<ClientStat> = orders_in_window(from, to)
+        .group_by(Order::CLIENT_SERVICE)
+        .count_all()
+        .limit(MAX_CLIENT_SERVICES)
+        .fetch_groups(|g| ClientStat {
+            client_service: g.key().map(Val::as_text).unwrap_or_default(),
+            orders: g.count_all() as usize,
+            paid_amount: 0,
+        })?;
+    let paid_by_client = orders_in_window(from, to)
+        .filter(Order::status.is_in(PAID_STATUSES))
+        .group_by(Order::CLIENT_SERVICE)
+        .sum(Order::AMOUNT)
+        .limit(MAX_CLIENT_SERVICES)
+        .fetch_groups(|g| {
+            (
+                g.key().map(Val::as_text).unwrap_or_default(),
+                g.sum(Order::AMOUNT).unwrap_or(0),
+            )
+        })?;
+    for (client, amount) in paid_by_client {
+        match by_client.iter_mut().find(|c| c.client_service == client) {
+            Some(c) => c.paid_amount = amount,
+            // A client with paid orders always has orders, so this is
+            // unreachable in practice; pushing rather than dropping keeps the
+            // money visible if it ever is not.
+            None => by_client.push(ClientStat {
+                client_service: client,
+                orders: 0,
+                paid_amount: amount,
+            }),
         }
     }
 
     Ok(Json(AdminSummary {
-        total_orders: rows.len(),
-        by_status: status_counts
-            .into_iter()
-            .map(|(status, count)| StatusCount { status, count })
-            .collect(),
+        total_orders,
+        by_status,
         total_paid_amount,
         total_refunded,
-        by_client: client_stats
-            .into_iter()
-            .map(|(client_service, orders, paid_amount)| ClientStat {
-                client_service,
-                orders,
-                paid_amount,
-            })
-            .collect(),
+        by_client,
     }))
+}
+
+/// The statuses that mean money was collected. `refunded` counts as collected
+/// gross; the refund shows up separately in `total_refunded`.
+const PAID_STATUSES: [&str; 2] = ["paid", "refunded"];
+
+/// The orders table restricted to the operator's `from`/`to` window — the one
+/// place that predicate is built, so every figure in the summary ranges over
+/// exactly the same rows.
+fn orders_in_window(from: Option<i64>, to: Option<i64>) -> Query {
+    let mut q = Query::on(Order::TABLE);
+    if let Some(f) = from {
+        q = q.filter(Order::created_at.gte(f));
+    }
+    if let Some(t) = to {
+        q = q.filter(Order::created_at.lte(t));
+    }
+    q
 }
 
 // ─── Operator: client block list + audit ────────────────────────────────────
@@ -916,6 +955,25 @@ fn write_admin_audit(action: &str, target: Option<&str>, detail: Option<String>)
     });
 }
 
+/// Blocked client apps the operator list will serve in one response. Beyond
+/// this the endpoint refuses rather than reporting the rest as unblocked.
+const MAX_BLOCKED_CLIENTS: usize = 500;
+
+/// How many status groups `admin_summary` will materialize.
+///
+/// `group_by(status)` yields one item per distinct status, and the statuses an
+/// order may hold are a closed set (`created` / `paid` / `refunded` /
+/// `canceled`). A couple of spare slots so a new status added to the model is
+/// reported rather than silently dropped from the summary.
+const MAX_ORDER_STATUSES: usize = 16;
+
+/// How many client-app groups the operator aggregates will materialize.
+///
+/// `group_by(client_service)` yields one item per distinct calling app. That
+/// set grows with onboarding rather than with order volume, which makes it slow
+/// to grow and not bounded — so the ceiling is stated here, at the read.
+const MAX_CLIENT_SERVICES: usize = 500;
+
 /// One client-app partition in the operator client list.
 #[derive(Serialize, schemars::JsonSchema)]
 struct ClientInfo {
@@ -929,26 +987,36 @@ struct ClientInfo {
 /// Operator: the deployment's client-app partitions — each distinct
 /// `client_service` with its order count and current block status.
 ///
-/// independent-reads: one ordered full scan of the orders table (bounded by the
-/// deployment's order count, same posture as `admin_summary`) tallied per app,
-/// overlaid with the (small) block list. Acceptable for v1; a high-volume
-/// deployment would precompute rollups.
+/// The order tally is a GROUPED aggregate, so its cost and its result size are
+/// the number of client apps, not the number of orders. It used to read every
+/// order row into the component and count them by hand, with no bound at all.
 fn admin_list_clients(_req: &mut Req<'_>) -> Result<Json<Vec<ClientInfo>>, ApiError> {
     require_owner()?;
 
-    let order_rows = Query::on(Order::TABLE)
-        .fetch_all()?;
-    let mut counts: Vec<(String, usize)> = Vec::new();
-    for r in &order_rows {
-        let cs = Order::from_row(r).client_service;
-        match counts.iter_mut().find(|(k, _)| *k == cs) {
-            Some((_, n)) => *n += 1,
-            None => counts.push((cs, 1)),
-        }
-    }
+    let mut counts: Vec<(String, usize)> = Query::on(Order::TABLE)
+        .group_by(Order::CLIENT_SERVICE)
+        .count_all()
+        .limit(MAX_CLIENT_SERVICES)
+        .fetch_groups(|g| {
+            (g.key().map(Val::as_text).unwrap_or_default(), g.count_all() as usize)
+        })?;
 
-    let blocked: Vec<String> = Query::on(BlockedClient::TABLE)
-        .fetch_all()?
+    // The block list is bounded by the operator's own actions, but "bounded in
+    // practice" is what the previous unbounded read here was too. It is read
+    // WITH its total so a short page is detectable: a blocked app missing from
+    // this list reads as unblocked, which is the one wrong answer this endpoint
+    // must not give quietly.
+    let (blocked_rows, blocked_total) = Query::on(BlockedClient::TABLE)
+        .limit(MAX_BLOCKED_CLIENTS)
+        .fetch_all_with_total()?;
+    if blocked_total > blocked_rows.len() as u64 {
+        return Err(ApiError::internal(format!(
+            "this deployment has {blocked_total} blocked clients and the operator client list \
+             serves at most {MAX_BLOCKED_CLIENTS}; it would report the remainder as unblocked. \
+             Unblock apps that no longer need to be listed, or paginate this endpoint."
+        )));
+    }
+    let blocked: Vec<String> = blocked_rows
         .iter()
         .map(|r| BlockedClient::from_row(r).client_service)
         .collect();
@@ -1097,10 +1165,10 @@ fn admin_list_audit(req: &mut Req<'_>) -> Result<Json<CursorPage<AuditOut>>, Api
     let (limit, cursor) = page_params(req);
     let mut q = Query::on(AdminAudit::TABLE);
     if let Some(action) = req.query("action").filter(|s| !s.is_empty()) {
-        q = q.where_eq(AdminAudit::ACTION, action);
+        q = q.filter(AdminAudit::action.eq(action));
     }
     let page = q
-        .keyset_by(AdminAudit::AT, SortDir::Desc)
+        .order(AdminAudit::at.desc())
         .limit(limit)
         .cursor(cursor)
         .fetch_page(|r| audit_out(r))?;

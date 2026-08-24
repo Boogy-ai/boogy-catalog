@@ -32,7 +32,6 @@ mod ws;
 
 use models::{AdminAudit, Comment, Config, Member, Proposal, ProposalAction, Sponsorship, Vote};
 
-use boogy_sdk::pagination::{decode, Cursor};
 
 /// The caller's audience for this deployment — host-attested, hardcodes NO
 /// identity (the module is provisionable by anyone).
@@ -103,13 +102,13 @@ pub fn require_voter() -> Result<String, ApiError> {
 
 /// Shared keyset-pagination params: `?limit=` (default 50, clamped 1..=200) +
 /// opaque `?cursor=` (fail-soft to page one).
-pub fn page_params(req: &mut Req<'_>) -> (usize, Option<Cursor>) {
+pub fn page_params(req: &mut Req<'_>) -> (usize, Option<String>) {
     let limit = req
         .query("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(50)
         .clamp(1, 200);
-    let cursor = req.query("cursor").and_then(decode);
+    let cursor = req.query("cursor").map(str::to_string);
     (limit, cursor)
 }
 

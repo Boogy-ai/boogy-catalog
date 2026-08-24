@@ -42,8 +42,8 @@ boogy_sdk::wit_glue!(bindings, ResendBase, with_jobs);
 
 use boogy_sdk::jobs::JobSpec;
 use boogy_sdk::model::{Id, Model, Timestamp};
-use boogy_sdk::pagination::{decode, CursorPage};
-use boogy_sdk::store::{SortDir, Val};
+use boogy_sdk::pagination::{CursorPage};
+use boogy_sdk::store::Val;
 use boogy_sdk::{schema_decl::Schema, Api, JobRouter};
 
 use bindings::boogy::platform::outbound_http;
@@ -540,15 +540,15 @@ struct MessageOut {
 }
 
 /// Shared keyset-pagination params for every list endpoint: `?limit=` (default
-/// 50, clamped 1..=200) + an opaque `?cursor=` decoded back to a [`Cursor`]
+/// 50, clamped 1..=200) + an opaque `?cursor=` carried through as the opaque token it is
 /// (`None` on the first page or a malformed cursor — fail-soft to page one).
-fn page_params(req: &mut Req<'_>) -> (usize, Option<boogy_sdk::pagination::Cursor>) {
+fn page_params(req: &mut Req<'_>) -> (usize, Option<String>) {
     let limit = req
         .query("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(50)
         .clamp(1, 200);
-    let cursor = req.query("cursor").and_then(decode);
+    let cursor = req.query("cursor").map(str::to_string);
     (limit, cursor)
 }
 
@@ -575,8 +575,8 @@ fn list_messages(req: &mut Req<'_>) -> Result<Json<CursorPage<MessageOut>>, ApiE
     let principal = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
     let (limit, cursor) = page_params(req);
     let page = Query::on(Message::TABLE)
-        .where_eq(DEFAULT_OWNER_COL, principal.as_str())
-        .keyset_by(Message::CREATED_AT, SortDir::Desc)
+        .filter(Message::owner_principal.eq(principal.as_str()))
+        .order(Message::created_at.desc())
         .limit(limit)
         .cursor(cursor)
         .fetch_page(|r| message_out(r))?;
@@ -657,8 +657,8 @@ fn list_templates(req: &mut Req<'_>) -> Result<Json<CursorPage<TemplateOut>>, Ap
     let principal = auth::current_principal().ok_or_else(ApiError::unauthenticated)?;
     let (limit, cursor) = page_params(req);
     let page = Query::on(Template::TABLE)
-        .where_eq(DEFAULT_OWNER_COL, principal.as_str())
-        .keyset_by(Template::CREATED_AT, SortDir::Desc)
+        .filter(Template::owner_principal.eq(principal.as_str()))
+        .order(Template::created_at.desc())
         .limit(limit)
         .cursor(cursor)
         .fetch_page(|r| template_out(r))?;
@@ -731,19 +731,19 @@ fn admin_list_messages(req: &mut Req<'_>) -> Result<Json<CursorPage<AdminMessage
 
     let mut q = Query::on(Message::TABLE);
     if let Some(p) = req.query("principal").filter(|s| !s.is_empty()) {
-        q = q.where_eq(Message::OWNER_PRINCIPAL, p);
+        q = q.filter(Message::owner_principal.eq(p));
     }
     if let Some(s) = req.query("status").filter(|s| !s.is_empty()) {
-        q = q.where_eq(Message::STATUS, s);
+        q = q.filter(Message::status.eq(s));
     }
     if let Some(t) = req.query("to").filter(|s| !s.is_empty()) {
-        q = q.where_eq(Message::TO_ADDR, t);
+        q = q.filter(Message::to_addr.eq(t));
     }
     if let Some(since) = req.query("since").and_then(|s| s.parse::<i64>().ok()) {
-        q = q.where_gte(Message::CREATED_AT, since);
+        q = q.filter(Message::created_at.gte(since));
     }
     let page = q
-        .keyset_by(Message::CREATED_AT, SortDir::Desc)
+        .order(Message::created_at.desc())
         .limit(limit)
         .cursor(cursor)
         .fetch_page(|r| admin_message_out(r))?;
@@ -809,7 +809,7 @@ fn admin_list_blocks(req: &mut Req<'_>) -> Result<Json<CursorPage<BlockOut>>, Ap
     require_operator()?;
     let (limit, cursor) = page_params(req);
     let page = Query::on(BlockedSender::TABLE)
-        .keyset_by(BlockedSender::CREATED_AT, SortDir::Desc)
+        .order(BlockedSender::created_at.desc())
         .limit(limit)
         .cursor(cursor)
         .fetch_page(|r| block_out(r))?;
