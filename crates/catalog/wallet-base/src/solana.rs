@@ -25,7 +25,7 @@
 //!   on-chain (send/simulate) outside the store `tx` (`outbound_http` is denied
 //!   inside a `tx`).
 
-use boogy_sdk::jobs::JobSpec;
+use boogy_sdk::jobs::{EnqueueError, JobSpec};
 use boogy_sdk::model::{Id, Model, Timestamp};
 use boogy_sdk::signing::SigAlg;
 use serde::{Deserialize, Serialize};
@@ -372,7 +372,27 @@ pub fn do_solana_send(principal: &str, body: SolanaIntentReq) -> Result<SendOut,
             idempotency_key: Some(format!("broadcast:{tx_id}")),
             ..Default::default()
         })
-        .map_err(|e| ApiError::internal(format!("enqueue broadcast: {e}")))?;
+        .map_err(|e| match e {
+            // A FULL QUEUE IS NOT A SERVER FAULT. `QueueFull` means this tenant
+            // is at its background-job depth cap — designed backpressure, and a
+            // decision that belongs to the caller: shed, retry later, or
+            // escalate. Returning 500 tells the client the service is broken
+            // while it is behaving exactly as specified, and buries a capacity
+            // signal under a fault signal.
+            //
+            // The other variants really are defects in this service:
+            // `InvalidHandler` means the manifest does not declare the handler,
+            // and `BackendUnavailable` means the `background_jobs` capability is
+            // missing. Those stay 500.
+            EnqueueError::QueueFull(d) => ApiError::rate_limited(
+                format!(
+                    "background job queue is at capacity ({} of {}); retry shortly",
+                    d.depth, d.cap
+                ),
+                1,
+            ),
+            other => ApiError::internal(format!("enqueue broadcast: {other}")),
+        })?;
 
         Ok(tx_id)
     })?;

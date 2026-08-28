@@ -40,7 +40,7 @@ mod bindings {
 
 boogy_sdk::wit_glue!(bindings, ResendBase, with_jobs);
 
-use boogy_sdk::jobs::JobSpec;
+use boogy_sdk::jobs::{EnqueueError, JobSpec};
 use boogy_sdk::model::{Id, Model, Timestamp};
 use boogy_sdk::pagination::{CursorPage};
 use boogy_sdk::store::Val;
@@ -304,7 +304,27 @@ fn enqueue_send(message_id: u64) -> Result<(), ApiError> {
         idempotency_key: Some(format!("send_email:{message_id}")),
         ..Default::default()
     })
-    .map_err(|e| ApiError::internal(format!("enqueue send: {e}")))?;
+    .map_err(|e| match e {
+            // A FULL QUEUE IS NOT A SERVER FAULT. `QueueFull` means this tenant
+            // is at its background-job depth cap — designed backpressure, and a
+            // decision that belongs to the caller: shed, retry later, or
+            // escalate. Returning 500 tells the client the service is broken
+            // while it is behaving exactly as specified, and buries a capacity
+            // signal under a fault signal.
+            //
+            // The other variants really are defects in this service:
+            // `InvalidHandler` means the manifest does not declare the handler,
+            // and `BackendUnavailable` means the `background_jobs` capability is
+            // missing. Those stay 500.
+            EnqueueError::QueueFull(d) => ApiError::rate_limited(
+                format!(
+                    "background job queue is at capacity ({} of {}); retry shortly",
+                    d.depth, d.cap
+                ),
+                1,
+            ),
+            other => ApiError::internal(format!("enqueue send: {other}")),
+        })?;
     Ok(())
 }
 
