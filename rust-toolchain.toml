@@ -1,3 +1,19 @@
+# Pinned to an EXACT version, not `stable`.
+#
+# Some tests compare a compiler diagnostic byte for byte (`boogy-sdk`'s
+# `expr_typing` compile-fail fixtures). On a floating channel those fixtures are
+# pinned to whatever stable each machine happens to resolve, so two boxes
+# disagree and the fixtures can only ever match one of them — and the usual
+# remedy, re-blessing whatever the local compiler printed, quietly accepts any
+# genuine diagnostic regression that landed in the same release window along
+# with the cosmetic rewording it was meant to absorb.
+#
+# With a version here, a compiler bump is a deliberate, reviewable change: bump
+# this line, re-bless the fixtures, and read the diff.
+#
+# rustup installs this toolchain (and the listed targets) on demand, so a
+# developer on a different version needs no manual step — the first `cargo`
+# invocation in this directory fetches it.
 [toolchain]
-channel = "stable"
+channel = "1.98.1"
 targets = ["wasm32-wasip2"]
