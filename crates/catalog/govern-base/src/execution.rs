@@ -181,6 +181,7 @@ fn run_action(a: &ProposalAction) -> Result<String, String> {
                 vec![("Authorization".to_string(), a.secret_header_ref.clone())]
             };
             let req = outbound_http::OutboundRequest {
+                connection_auth: None,
                 method: a.method.clone(),
                 url: a.target.clone(),
                 headers,

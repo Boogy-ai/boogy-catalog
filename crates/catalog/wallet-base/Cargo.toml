@@ -5,7 +5,7 @@ edition = "2021"
 description = "Catalog service: a multi-chain custodial wallet. Per-tenant EVM key custody + signing, deployed BYO-config."
 
 [dependencies]
-boogy-sdk = { path = "../../boogy-sdk" }
+boogy-sdk = { git = "https://github.com/Boogy-ai/boogy-sdk" }
 # Pure, host-testable EVM logic (alloy-backed: key derivation, address
 # computation, transaction RLP encoding + signing) lives in the sibling
 # wallet-base-core crate (rlib); its unit tests run via `cargo test --workspace`.
@@ -22,3 +22,8 @@ hex = "0.4"
 # breaks `cargo test --workspace`. Host-testable pure logic lives in
 # wallet-base-core (rlib).
 crate-type = ["cdylib"]
+
+[build-dependencies]
+# build.rs syncs the WIT files matching this SDK revision into ./wit so
+# wit_bindgen::generate! (manifest-relative literal path) always resolves.
+boogy-wit = { git = "https://github.com/Boogy-ai/boogy-sdk" }

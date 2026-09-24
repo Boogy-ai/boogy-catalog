@@ -23,10 +23,13 @@
 //!   (`auth::current_principal` + an owner-column filter, 404-masking).
 //! - **The operator** (the service owner — the provisioner) uses `/admin/*` to
 //!   list/filter ALL principals' messages and to block/unblock a sender. The
-//!   owner reaches it DIRECTLY (their agent token — they can curl it) or via
-//!   their own backend (a workload). [`require_operator`] gates it with the
-//!   host-attested `caller_is_service_owner` capability, so NO identity is
-//!   hardcoded in the manifest (the module is provisionable by anyone).
+//!   owner reaches it from their own backend (a workload, or an OBO hop from
+//!   one), or in person after signing in to THIS service (an app session).
+//!   A bare platform credential — the token they deploy with — is refused at
+//!   the edge before this module runs; see [`require_operator`], which gates
+//!   `/admin/*` with the host-attested `caller_is_service_owner` capability,
+//!   so NO identity is hardcoded in the manifest (the module is provisionable
+//!   by anyone).
 //!
 //! Tables are `#[derive(Model)]` structs (see [`models`]); CRUD goes through
 //! the typed `db_*` + `Query` layer (handlers never touch raw column literals).
@@ -147,15 +150,23 @@ impl Api for ResendBase {
 ///
 /// Admits, in order:
 /// 1. `caller_is_service_owner()` — the host attests that the caller is THIS
-///    service's owner: the provisioner's own **agent token** (their handle,
-///    resolved host-side against the agents registry) OR one of their own
-///    **workloads** (direct). This is what lets the human owner curl `/admin`.
+///    service's owner: one of their own **workloads** (direct), or the owner
+///    themself signed in to this service through an **app session** (this
+///    module sees a `pw_…` pairwise mask; the host resolves the real account
+///    behind it rather than parsing the mask, so the owner is not masked out
+///    of their own admin surface).
 /// 2. An **OBO** hop where the owner's own backend acts on behalf of a user —
 ///    `caller_is_service_owner` reflects the delegated end-user `principal`, so
 ///    the owner is recognized via the ATTESTED `actor` workload here.
 ///
 /// Anyone else → `403`. `/admin/*` ingress is just `authenticated` (rejects
-/// anonymous); this handler is the real gate.
+/// anonymous); this handler is the real gate — but it is not the FIRST gate.
+/// An owner holding only a bare platform credential (the token they deploy or
+/// run the console with) never reaches this check at all: on a non-public
+/// route the host rejects that credential at the edge with
+/// `403 app_plane_requires_app_credential`, because an app-plane route
+/// requires an app-plane credential. Curling `/admin/*` with a deploy token
+/// does not work; sign in to the service, or call from your own backend.
 fn require_operator() -> Result<(), ApiError> {
     if caller_is_service_owner() {
         return Ok(());
@@ -494,6 +505,7 @@ fn send_batch(Json(body): Json<BatchReq>) -> Result<Json<BatchResult>, ApiError>
 /// value); the wasm never sees it. Returns the provider message id on success.
 pub(crate) fn resend_send(input: &SendInput) -> Result<String, String> {
     let request = outbound_http::OutboundRequest {
+        connection_auth: None,
         method: "POST".to_string(),
         url: "https://api.resend.com/emails".to_string(),
         headers: vec![("Content-Type".to_string(), "application/json".to_string())],

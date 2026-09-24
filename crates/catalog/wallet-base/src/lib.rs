@@ -25,7 +25,7 @@
 mod bindings {
     wit_bindgen::generate!({
         world: "service-with-jobs",
-        path: "../../boogy-wit/wit",
+        path: "wit",
     });
 }
 

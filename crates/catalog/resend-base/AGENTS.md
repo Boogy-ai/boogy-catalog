@@ -27,13 +27,17 @@ All calls arrive over `peer::fetch` from your own backend. Three shapes:
 |---|---|---|
 | on behalf of a user (OBO) | `principal = agent_<user>`, `actor = boogy://<you>/services/<svc>` | user-triggered mail (welcome, receipt) — the message is owned by that user |
 | as your service | `principal = boogy://<you>/services/<svc>` | system mail |
-| as the operator | YOU directly (your own agent token) OR a workload owned by you | the `/admin/*` surface |
+| as the operator | a workload you own (or an OBO hop from one), or YOU after signing in to this service | the `/admin/*` surface |
 
 End-user routes are scoped to `principal` (each sender sees only their own
-mail). The operator surface admits **the service owner**: you can curl `/admin/*`
-directly with your own token (the host attests `caller_is_service_owner` — it
-resolves your agent's handle host-side), or your backend can call it as a
-workload. No identity is configured anywhere.
+mail). The operator surface admits **the service owner**: your backend calls it
+as a workload you own, or you reach it yourself once you have signed in to this
+service — an app session, where the host resolves your real account behind the
+per-service pairwise mask (`caller_is_service_owner`). **A bare platform
+credential does not work**: `/admin/*` ingress is `authenticated`, and the token
+you deploy or run the console with is refused at the edge with
+`403 app_plane_requires_app_credential` before this module runs. No identity is
+configured anywhere.
 
 ## Sending
 
@@ -86,7 +90,9 @@ all scoped to the calling principal.
 - Message `status`: `queued` → `sent` | `failed` (terminal attempt failed) |
   `canceled` (operator). `sent`/`failed`/`canceled` are terminal.
 - `400` — bad request / missing template variable. `401` — unauthenticated.
-- `403` — blocked sender, or a non-operator on `/admin/*`. `404` — missing or
+- `403` — blocked sender, or a non-operator on `/admin/*`; with
+  `app_plane_requires_app_credential`, the caller used a platform credential on
+  a non-public route and never reached the module. `404` — missing or
   not-yours (deny-by-existence-mask).
 
 ## Capabilities required (already in the manifest)

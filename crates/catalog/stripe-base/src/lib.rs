@@ -496,6 +496,7 @@ pub(crate) fn create_stripe_session(
         headers.push(("Idempotency-Key".to_string(), key.to_string()));
     }
     let request = outbound_http::OutboundRequest {
+        connection_auth: None,
         method: "POST".to_string(),
         url: "https://api.stripe.com/v1/checkout/sessions".to_string(),
         headers,

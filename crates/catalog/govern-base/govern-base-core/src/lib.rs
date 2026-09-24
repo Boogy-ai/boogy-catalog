@@ -360,6 +360,47 @@ pub fn validate_action(a: &ActionSpec) -> Result<(), String> {
     }
 }
 
+/// Extract the `<owner>` from a workload URI `boogy://<owner>/services/<name>[@ver]`.
+///
+/// `None` for agent principals (`agent_…`), malformed URIs, non-`services`
+/// kinds, and URIs carrying extra path segments — a bare workload URI is
+/// exactly three components.
+pub fn workload_owner(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("boogy://")?; // "<owner>/services/<name>[@ver]"
+    let mut parts = rest.split('/');
+    let owner = parts.next().filter(|s| !s.is_empty())?;
+    if parts.next()? != "services" {
+        return None;
+    }
+    parts.next().filter(|s| !s.is_empty())?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(owner.to_string())
+}
+
+/// True when the ATTESTED delegation actor is a workload owned by this
+/// deployment's owner — i.e. the operator's own backend calling on a user's
+/// behalf (OBO).
+///
+/// This is the second half of the operator check, and it is only needed
+/// because the first half stopped covering it: `caller_is_service_owner()` is
+/// true for the owner's agent or their own DIRECT workload call, and an OBO
+/// call is neither — its principal is the delegated user. Without this arm a
+/// governance space with `eligibility = "open"` silently DOWNGRADED the
+/// operator's own backend to an ordinary `Voter`, which is why an operator
+/// route called through OBO behaved like a member's.
+///
+/// `actor` is `Identity::actor`, which is host-attested and `Some` only on a
+/// delegated call; a guest cannot set it. Fails closed on `None`, on an agent
+/// principal, and on any URI owned by anyone else.
+pub fn actor_is_owner_workload(actor: Option<&str>, self_owner: &str) -> bool {
+    !self_owner.is_empty()
+        && actor
+            .and_then(workload_owner)
+            .is_some_and(|o| o == self_owner)
+}
+
 /// True if `author` appears in a comma-separated exempt-proposers list (entries
 /// are trimmed; empty entries never match). The pure, listable half of the
 /// co-sponsorship fast-track — the owner-identity check stays in the service layer
@@ -420,6 +461,65 @@ mod action_tests {
             method: "POST".into(),
         })
         .is_err());
+    }
+}
+
+#[cfg(test)]
+mod operator_actor_tests {
+    use super::*;
+
+    #[test]
+    fn extracts_the_owner_from_a_bare_workload_uri() {
+        assert_eq!(
+            workload_owner("boogy://acme/services/backend"),
+            Some("acme".to_string())
+        );
+        assert_eq!(
+            workload_owner("boogy://acme/services/backend@3"),
+            Some("acme".to_string())
+        );
+        for bad in [
+            "agent_018f2c3d",
+            "boogy://acme/modules/x",
+            "boogy://acme/services/",
+            "boogy://acme/services/x/extra",
+            "boogy://",
+            "",
+        ] {
+            assert_eq!(workload_owner(bad), None, "{bad}");
+        }
+    }
+
+    /// The OBO-owner path: the operator's own backend calling on a user's
+    /// behalf is the operator. Every other arm fails closed — that is what
+    /// keeps the fix from widening `Owner` beyond the one case it is for.
+    #[test]
+    fn only_the_owners_own_workload_actor_is_the_operator() {
+        assert!(actor_is_owner_workload(
+            Some("boogy://acme/services/backend"),
+            "acme"
+        ));
+        assert!(actor_is_owner_workload(
+            Some("boogy://acme/services/backend@7"),
+            "acme"
+        ));
+        // A different owner's workload is not the operator, however it is
+        // shaped — including a handle that merely starts with the owner's.
+        assert!(!actor_is_owner_workload(
+            Some("boogy://mallory/services/backend"),
+            "acme"
+        ));
+        assert!(!actor_is_owner_workload(
+            Some("boogy://acme2/services/backend"),
+            "acme"
+        ));
+        // A direct (non-delegated) call has no actor at all.
+        assert!(!actor_is_owner_workload(None, "acme"));
+        // An agent principal in the actor slot is not a workload.
+        assert!(!actor_is_owner_workload(Some("agent_018f2c3d"), "acme"));
+        // An unresolvable self-identity must never make everyone the owner.
+        assert!(!actor_is_owner_workload(Some("boogy:///services/x"), ""));
+        assert!(!actor_is_owner_workload(None, ""));
     }
 }
 

@@ -64,6 +64,7 @@ fn call_jsonrpc(
     });
 
     let request = outbound_http::OutboundRequest {
+        connection_auth: None,
         method: "POST".to_string(),
         url: url.to_string(),
         headers: vec![("Content-Type".to_string(), "application/json".to_string())],
@@ -129,6 +130,7 @@ pub fn call_cosmos_rpc(req: &CosmosRestRequest) -> Result<RpcResponse, ApiError>
     };
 
     let request = outbound_http::OutboundRequest {
+        connection_auth: None,
         method: req.method.to_string(),
         url: format!("{COSMOS_LCD_URL}{}", req.path),
         headers: vec![("Content-Type".to_string(), "application/json".to_string())],
@@ -179,6 +181,7 @@ fn btc_fetch(req: &BtcRestRequest) -> Result<(u16, Vec<u8>), ApiError> {
     };
 
     let request = outbound_http::OutboundRequest {
+        connection_auth: None,
         method: req.method.to_string(),
         url: format!("{BTC_ESPLORA_URL}{}", req.path),
         headers,
