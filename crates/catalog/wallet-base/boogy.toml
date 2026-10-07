@@ -23,7 +23,8 @@ authors = ["Boogy"]
 owner = "alice"
 
 [routing]
-# Claim the whole owner subtree so all wallet routes mount at the root.
+# The root: every service is served at the root of its own address, so the
+# wallet routes are reached there.
 path = "/"
 methods = ["*"]
 

@@ -24,8 +24,9 @@ manifest declares no owner.
    ```
    `stripe_secret_key` is injected as the `Authorization` header on outbound calls;
    `stripe_webhook_secret` is verified host-side (the wasm never sees either).
-3. Point a Stripe webhook at `https://<handle>.<base>/<service>/webhook` for the
-   `checkout.session.completed` event.
+3. Point a Stripe webhook at `https://<service-address>/webhook` for the
+   `checkout.session.completed` event — `<service-address>` is the instance's own
+   address, the `URL:` `boogy provision` printed.
 
 ## Caller contract — the multi-client model
 

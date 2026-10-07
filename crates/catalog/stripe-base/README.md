@@ -464,8 +464,11 @@ deploy — the owner is your deploying principal.
      boogy secret set <owner>/stripe-base/stripe_webhook_secret --stdin
    ```
 
-4. **Point a Stripe webhook** at `https://<handle>.<base>/<service>/webhook` for the
-   `checkout.session.completed` event.
+4. **Point a Stripe webhook** at `https://<service-address>/webhook` for the
+   `checkout.session.completed` event, where `<service-address>` is your
+   instance's own address — the `URL:` `boogy provision` printed. It is fixed
+   for the life of the instance; a deleted and re-created instance gets a new
+   address, and its webhook endpoint must be updated in Stripe.
 
 5. **Create checkouts** — from your apps (peer call) or directly (owner).
 
@@ -475,7 +478,7 @@ deploy — the owner is your deploying principal.
 
 ```bash
 # 1. Create a checkout (async default; as the owner — a peer app omits client_ref)
-curl -X POST https://<handle>.<base>/<service>/checkout \
+curl -X POST https://<service-address>/checkout \
   -H "authorization: Bearer <token>" -H 'content-type: application/json' \
   -d '{"amount":2000,"currency":"usd","product_name":"Pro Plan",
        "success_url":"https://app/ok","cancel_url":"https://app/cancel",
@@ -486,7 +489,7 @@ curl -X POST https://<handle>.<base>/<service>/checkout \
 #    is {"order_id":42,"status":"pending","checkout_url":"https://checkout.stripe.com/…"}.
 
 # 2. Poll the order until the job has created the session (status → "pending").
-curl "https://<handle>.<base>/<service>/orders/42" -H "authorization: Bearer <token>"
+curl "https://<service-address>/orders/42" -H "authorization: Bearer <token>"
 # → {"id":42,"status":"pending","checkout_url":"https://checkout.stripe.com/c/pay/cs_…",...}
 # redirect the buyer to checkout_url
 
@@ -495,7 +498,7 @@ curl "https://<handle>.<base>/<service>/orders/42" -H "authorization: Bearer <to
 #    durable apply job flips order 42 to "paid".
 
 # 4. Check the order (owner sees all apps; ?client= to filter)
-curl "https://<handle>.<base>/<service>/orders?client=storefront" \
+curl "https://<service-address>/orders?client=storefront" \
   -H "authorization: Bearer <token>"
 # → {"items":[{"id":42,"client_service":"storefront","status":"paid",...}],"count":1}
 ```

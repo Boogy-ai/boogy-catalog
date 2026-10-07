@@ -24,8 +24,8 @@ authors = ["Boogy"]
 owner = "alice"
 
 [routing]
-# Claim the whole owner subtree so /webhook, /checkout, /orders all route
-# at the root.
+# The root: every service is served at the root of its own address, so
+# /webhook, /checkout and /orders are reached there.
 path = "/"
 methods = ["*"]
 
