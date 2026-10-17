@@ -37,7 +37,7 @@ body. Your role is resolved per request:
 | You are calling… | Identity the module sees | Role | Sees |
 |---|---|---|---|
 | one of **your** apps (peer call) | attested `boogy://<you>/services/<app>` | `ClientApp(app)` | only that app's orders |
-| **you** directly (your own agent token) | attested by `caller_is_service_owner` | `Owner` | all your apps (`?client=` to filter) |
+| **you**, signed in to this service | attested by `caller_is_service_owner` | `Owner` | all your apps (`?client=` to filter) |
 | Stripe (the webhook) | none (anonymous) | — | authenticated by HMAC signature, not identity |
 | a different owner's workload / non-owner agent / anon | — | `Denied` | `403` |
 

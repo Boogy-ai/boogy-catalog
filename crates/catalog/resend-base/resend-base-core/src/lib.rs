@@ -1,10 +1,8 @@
 //! Pure, host-testable logic for the resend-base catalog service.
 //!
-//! Three pieces, all unit-tested off-wasm:
+//! Two pieces, both unit-tested off-wasm:
 //! - [`render`] — `{{ variable }}` template substitution via the `upon` engine.
 //! - [`resend_body`] — shapes the Resend `POST /emails` JSON body.
-//! - [`workload_owner`] — extracts the owner from a workload URI (the
-//!   operator-identity check).
 
 use std::collections::BTreeMap;
 
@@ -72,27 +70,6 @@ pub fn resend_body(input: &SendInput) -> Vec<u8> {
     serde_json::to_vec(&serde_json::Value::Object(map)).expect("serialize resend body")
 }
 
-/// Extract the `<owner>` from a workload URI `boogy://<owner>/services/<name>[@ver]`.
-///
-/// Returns `None` for agent principals (`agent_…`), malformed URIs, non-`services`
-/// kinds, or URIs with extra path segments. Used by the service's operator check:
-/// a caller whose attested workload owner matches the instance owner is the
-/// operator (the provisioner's own backend or dashboard).
-pub fn workload_owner(uri: &str) -> Option<String> {
-    let rest = uri.strip_prefix("boogy://")?; // "<owner>/services/<name>[@ver]"
-    let mut parts = rest.split('/');
-    let owner = parts.next().filter(|s| !s.is_empty())?;
-    if parts.next()? != "services" {
-        return None;
-    }
-    // Require a non-empty service-name segment, but reject extra path segments
-    // (a bare workload URI is exactly three components).
-    parts.next().filter(|s| !s.is_empty())?;
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(owner.to_string())
-}
 
 #[cfg(test)]
 mod render_tests {
@@ -160,33 +137,3 @@ mod resend_tests {
     }
 }
 
-#[cfg(test)]
-mod workload_owner_tests {
-    use super::*;
-
-    #[test]
-    fn extracts_owner_from_workload() {
-        assert_eq!(
-            workload_owner("boogy://alice/services/storefront"),
-            Some("alice".to_string())
-        );
-    }
-
-    #[test]
-    fn strips_optional_version() {
-        assert_eq!(
-            workload_owner("boogy://alice/services/storefront@3"),
-            Some("alice".to_string())
-        );
-    }
-
-    #[test]
-    fn rejects_agents_and_malformed() {
-        assert_eq!(workload_owner("agent_018f2c3d"), None);
-        assert_eq!(workload_owner("boogy://alice/modules/x"), None);
-        assert_eq!(workload_owner("boogy://alice/services/"), None);
-        assert_eq!(workload_owner("boogy://"), None);
-        assert_eq!(workload_owner(""), None);
-        assert_eq!(workload_owner("boogy://a/services/x/extra"), None);
-    }
-}

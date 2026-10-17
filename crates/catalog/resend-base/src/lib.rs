@@ -23,8 +23,8 @@
 //!   (`auth::current_principal` + an owner-column filter, 404-masking).
 //! - **The operator** (the service owner — the provisioner) uses `/admin/*` to
 //!   list/filter ALL principals' messages and to block/unblock a sender. The
-//!   owner reaches it from their own backend (a workload, or an OBO hop from
-//!   one), or in person after signing in to THIS service (an app session).
+//!   owner reaches it in person, signed in to THIS service (an app session);
+//!   no service is the operator, not even one under the owner's account.
 //!   A bare platform credential — the token they deploy with — is refused at
 //!   the edge before this module runs; see [`require_operator`], which gates
 //!   `/admin/*` with the host-attested `caller_is_service_owner` capability,
@@ -50,7 +50,7 @@ use boogy_sdk::store::Val;
 use boogy_sdk::{schema_decl::Schema, Api, JobRouter};
 
 use bindings::boogy::platform::outbound_http;
-use resend_base_core::{render, workload_owner, SendInput};
+use resend_base_core::{render, SendInput};
 
 mod jobs;
 mod models;
@@ -146,18 +146,16 @@ impl Api for ResendBase {
 
 /// Operator check for `/admin/*`. This is the PRIMARY gate, and it hardcodes
 /// NO identity — the module is provisionable by anyone, so the owner is learned
-/// at RUNTIME — NO identity is hardcoded (the module is provisionable by anyone).
+/// at RUNTIME.
 ///
-/// Admits, in order:
-/// 1. `caller_is_service_owner()` — the host attests that the caller is THIS
-///    service's owner: one of their own **workloads** (direct), or the owner
-///    themself signed in to this service through an **app session** (this
-///    module sees a `pw_…` pairwise mask; the host resolves the real account
-///    behind it rather than parsing the mask, so the owner is not masked out
-///    of their own admin surface).
-/// 2. An **OBO** hop where the owner's own backend acts on behalf of a user —
-///    `caller_is_service_owner` reflects the delegated end-user `principal`, so
-///    the owner is recognized via the ATTESTED `actor` workload here.
+/// Admits exactly `caller_is_service_owner()`: the host attests that the
+/// caller is THIS service's owner as a person, signed in to this service
+/// through an **app session** (this module sees a `pw_…` pairwise mask; the
+/// host resolves the real account behind it rather than parsing the mask, so
+/// the owner is not masked out of their own admin surface). No service is the
+/// operator, not even one under the owner's account: every module the owner
+/// installs runs as one, and an on-behalf-of call through one is the end
+/// user's call.
 ///
 /// Anyone else → `403`. `/admin/*` ingress is just `authenticated` (rejects
 /// anonymous); this handler is the real gate — but it is not the FIRST gate.
@@ -166,17 +164,9 @@ impl Api for ResendBase {
 /// route the host rejects that credential at the edge with
 /// `403 app_plane_requires_app_credential`, because an app-plane route
 /// requires an app-plane credential. Curling `/admin/*` with a deploy token
-/// does not work; sign in to the service, or call from your own backend.
+/// does not work; sign in to the service.
 fn require_operator() -> Result<(), ApiError> {
     if caller_is_service_owner() {
-        return Ok(());
-    }
-    let identity = bindings::boogy::platform::auth::current_identity();
-    let actor_owner = identity
-        .as_ref()
-        .and_then(|i| i.actor.as_deref())
-        .and_then(workload_owner);
-    if actor_owner == Some(self_identity().owner) {
         return Ok(());
     }
     Err(ApiError::forbidden("operator access required"))

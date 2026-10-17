@@ -29,7 +29,7 @@ Your role is resolved per request:
 
 | You are… | Role | Can |
 |---|---|---|
-| the service owner (your own agent token, attested by `caller_is_service_owner`) | **Owner** | operate `/admin/*`, manage the roll, moderate, guardian-cancel — **and** participate as a voter |
+| the service owner, signed in to this service (attested by `caller_is_service_owner`; no service, not even yours) | **Owner** | operate `/admin/*`, manage the roll, moderate, guardian-cancel — **and** participate as a voter |
 | an eligible participant | **Voter** | propose, co-sponsor, vote, comment |
 | anyone, when `read_access = public` | **Reader** | read proposals / tallies / comments |
 

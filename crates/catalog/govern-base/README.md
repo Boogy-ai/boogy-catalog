@@ -66,7 +66,7 @@ There are three roles, resolved host-side per request:
 
 | Role | Who | Can |
 |------|-----|-----|
-| **Owner** | you — the service owner (your agent, attested by `caller_is_service_owner`) | configure policy, manage the member roll, moderate, guardian-cancel, operate `/admin/*`, **and** participate as a voter |
+| **Owner** | you — the service owner, signed in to this service (attested by `caller_is_service_owner`; no service is the owner, not even yours) | configure policy, manage the member roll, moderate, guardian-cancel, operate `/admin/*`, **and** participate as a voter |
 | **Voter** | an eligible participant (see [Eligibility](#eligibility--sybil-resistance)) | propose, co-sponsor, vote, comment |
 | **Reader** | anyone — but only when you open reads | read proposals, tallies, comments |
 
@@ -648,7 +648,7 @@ mode = "public"
 
 | Caller | `audience()` | On a mutation |
 |--------|-------------|---------------|
-| You (your agent, `caller_is_service_owner`) | `Owner` | full operator + participant access |
+| You, signed in to this service (`caller_is_service_owner`; no service, not even yours) | `Owner` | full operator + participant access |
 | An eligible member (`open`, or on the roll) | `Voter` | propose / sponsor / vote / comment |
 | A non-member in a bounded mode | `Denied` | `403` |
 | Anonymous | `Reader` | reads per `read_access`; `403`/`401` on mutations |
@@ -685,22 +685,31 @@ mode = "public"
 
 `<service-address>` is your instance's own address — the `URL:` `boogy provision` (or `boogy deploy`) printed, such as `govern-k3v9.boogy.app`; every service is served at its root.
 
+The calls below show each request's shape. Every route here is
+`authenticated`, so each needs that person's **app credential for this
+service**: their session after signing in on its address (from a page served
+there, where the cookie rides along), or an app token where the service
+registers app-token redirect URIs. The token anyone deploys or logs in to the
+CLI with is a platform credential, refused on these routes at the edge
+(`403 app_plane_requires_app_credential`). The owner's calls pass only with the
+owner's own sign-in; no service passes as the owner.
+
 ```bash
 # 1. Configure: a member-gated space, short windows for the demo
 curl -X PUT https://<service-address>/admin/config \
-  -H "authorization: Bearer <owner-token>" -H 'content-type: application/json' \
+  -H "authorization: Bearer <owner-app-token>" -H 'content-type: application/json' \
   -d '{"eligibility":"members","sponsorship_threshold":1,"quorum":"0.4",
        "threshold":"0.5","veto_threshold":"0.334","min_voting_period_ms":3600000}'
 
 # 2. Add members to the roll
 curl -X POST https://<service-address>/admin/members \
-  -H "authorization: Bearer <owner-token>" -H 'content-type: application/json' \
+  -H "authorization: Bearer <owner-app-token>" -H 'content-type: application/json' \
   -d '{"principal":"agent_018f...alice"}'
 # (repeat for bob; → {"principal":"agent_...","weight":1,"role":""})
 
 # 3. Alice creates a proposal that, if passed, calls the treasury service
 curl -X POST https://<service-address>/proposals \
-  -H "authorization: Bearer <alice-token>" -H 'content-type: application/json' \
+  -H "authorization: Bearer <alice-app-token>" -H 'content-type: application/json' \
   -d '{"title":"Fund the docs grant","body":"Pay 500 to the docs team.",
        "actions":[{"action_type":"peer","method":"POST",
                    "target":"boogy://<owner>/services/treasury",
@@ -708,23 +717,23 @@ curl -X POST https://<service-address>/proposals \
 # → {"id":7,"status":"draft"}
 
 # 4. Open it; Bob co-sponsors → voting opens (electorate snapshotted)
-curl -X POST https://<service-address>/proposals/7/submit  -H "authorization: Bearer <alice-token>"
-curl -X POST https://<service-address>/proposals/7/sponsor -H "authorization: Bearer <bob-token>"
+curl -X POST https://<service-address>/proposals/7/submit  -H "authorization: Bearer <alice-app-token>"
+curl -X POST https://<service-address>/proposals/7/sponsor -H "authorization: Bearer <bob-app-token>"
 
 # 5. Members vote
 curl -X POST https://<service-address>/proposals/7/vote \
-  -H "authorization: Bearer <alice-token>" -H 'content-type: application/json' -d '{"option":"yes"}'
+  -H "authorization: Bearer <alice-app-token>" -H 'content-type: application/json' -d '{"option":"yes"}'
 curl -X POST https://<service-address>/proposals/7/vote \
-  -H "authorization: Bearer <bob-token>"   -H 'content-type: application/json' -d '{"option":"yes"}'
+  -H "authorization: Bearer <bob-app-token>"   -H 'content-type: application/json' -d '{"option":"yes"}'
 
 # 6. Watch the tally live (optional) or poll it
-curl "https://<service-address>/proposals/7/tally" -H "authorization: Bearer <alice-token>"
+curl "https://<service-address>/proposals/7/tally" -H "authorization: Bearer <alice-app-token>"
 # → {"yes":2,"no":0,"abstain":0,"veto":0,"ballots":2}
 
 # 7. After voting_end the tally finalizes; if it passes with actions it enters
 #    timelock, then execute_proposal calls the treasury service — exactly once,
 #    exactly as encoded in the proposal.
-curl "https://<service-address>/proposals/7" -H "authorization: Bearer <alice-token>"
+curl "https://<service-address>/proposals/7" -H "authorization: Bearer <alice-app-token>"
 # → {"id":7,"status":"executed", ... "final_yes":2, "final_ballots":2, ...}
 ```
 

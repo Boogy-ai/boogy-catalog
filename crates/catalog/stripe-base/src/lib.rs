@@ -197,9 +197,9 @@ enum Audience {
 /// 1. An attested caller workload (the `principal`, or the OBO `actor`) must be
 ///    owned by THIS service's owner to be a client app. A different owner's
 ///    workload → `Denied` (it is not an app of this deployment).
-/// 2. Otherwise the caller is an agent: only the SERVICE OWNER's agent (attested
-///    by `caller_is_service_owner()`) is the `Owner`; any other agent / anonymous
-///    → `Denied`.
+/// 2. Otherwise the caller is a person: only the SERVICE OWNER, signed in
+///    (attested by `caller_is_service_owner()`, which no service passes), is the
+///    `Owner`; anyone else / anonymous → `Denied`.
 fn audience() -> Audience {
     let our_owner = self_identity().owner;
     let identity = bindings::boogy::platform::auth::current_identity();
@@ -213,7 +213,7 @@ fn audience() -> Audience {
         }
         return Audience::Denied; // a different owner's workload
     }
-    // No attested workload → an agent. Only the service owner's agent is Owner.
+    // No attested workload → a person. Only the service owner is Owner.
     if caller_is_service_owner() {
         return Audience::Owner;
     }
@@ -689,20 +689,18 @@ fn get_order(req: &mut Req<'_>) -> Result<Json<OrderOut>, ApiError> {
 // Every /admin/* handler gates on `require_owner()` first. Ingress is just
 // `authenticated`; this is the real gate (host-attested, no hardcoded id).
 
-/// Operator gate for `/admin/*`: the SERVICE OWNER ONLY — their attested agent
-/// (the `Owner` audience), host-attested, NO hardcoded identity.
+/// Operator gate for `/admin/*`: the SERVICE OWNER ONLY, as a person (the
+/// `Owner` audience), host-attested, NO hardcoded identity.
 ///
-/// DELIBERATELY STRICTER than "any workload owned by the owner". `/admin` is a
-/// cross-client surface (lists every app's orders; issues refunds), so it gates
-/// on `audience() == Owner` — a client-app WORKLOAD owned by the same owner is
-/// `ClientApp`, NOT `Owner`, and is rejected. If it were admitted (e.g. via a
-/// bare `caller_is_service_owner()`, which is true for ANY owner-workload), one
-/// client app could read another app's orders — or refund them — through
-/// `/admin`, bypassing the per-client isolation the public routes enforce. The
-/// owner operates `/admin` as their own agent (a dashboard authenticated as the
-/// owner principal). If backend-workload `/admin` access is ever needed, add an
-/// explicit admin-workload allowlist to the manifest — do NOT widen this to all
-/// owner-workloads.
+/// `/admin` is a cross-client surface (lists every app's orders; issues
+/// refunds), so it gates on `audience() == Owner`: a client-app WORKLOAD owned
+/// by the same owner is `ClientApp`, NOT `Owner`, and is rejected. Were one
+/// admitted, a client app could read another app's orders — or refund them —
+/// through `/admin`, bypassing the per-client isolation the public routes
+/// enforce. (`caller_is_service_owner()` is false for every workload too, so
+/// `Owner` is the owner, signed in.) If a backend ever needs `/admin`, the
+/// owner grants that one caller explicitly — an API key for just those routes
+/// — rather than this widening to owner-workloads.
 fn require_owner() -> Result<(), ApiError> {
     match audience() {
         Audience::Owner => Ok(()),

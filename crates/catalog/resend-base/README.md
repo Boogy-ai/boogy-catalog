@@ -50,10 +50,10 @@ caller shapes, all expressed in Boogy's identity model:
 |--------|------------------------------|-------------|
 | Your backend, on behalf of a user (OBO) | `principal = agent_<user>`, `actor = boogy://<you>/services/<backend>` | "user signed up → welcome email" |
 | Your backend, as itself | `principal = boogy://<you>/services/<backend>` | system mail |
-| Your backend hitting `/admin/*` | a workload owned by you | operator tasks (list-all, block a sender) |
 
-The **operator surface is consumed by your own backend** (a workload), not by raw
-human tokens — see [The operator surface](#the-operator-surface).
+The **operator surface is used by you, signed in to this service** — not by a
+backend (not even yours) and not by a bare platform token. See
+[The operator surface](#the-operator-surface).
 
 ---
 
@@ -93,7 +93,7 @@ Key properties:
   inside a cross-service `tx` the email is sent **iff the transaction commits**.
 - **Every end-user read is sender-scoped** (missing and not-yours both `404`).
 - **Pure logic is unit-tested off-wasm** in [`resend-base-core`](./resend-base-core)
-  (template rendering via `upon`, Resend body shaping, workload-owner parsing).
+  (template rendering via `upon`, Resend body shaping).
 
 ---
 
@@ -302,21 +302,23 @@ identity is hardcoded** (the module is provisionable by anyone). It is a
 - `/admin/*` ingress is just `mode = "authenticated"` (rejects anonymous; no
   per-route override, names nobody).
 - In-handler, `require_operator()` calls `caller_is_service_owner()` — the host
-  attests whether the caller is **this service's owner**: their own **agent token**
-  (the platform resolves the handle host-side, against the agents registry) OR one
-  of their own **workloads**. An OBO hop where the owner's backend acts for a user
-  is admitted via the attested `actor`. Anyone else → `403`.
+  attests whether the caller is **this service's owner as a person**, signed in to
+  this service (the platform resolves the account behind the per-service pairwise
+  mask, against the agents registry). Anyone else → `403`, including every
+  service: any module you install runs as one of your workloads, so being yours
+  says nothing about who wrote it, and an OBO hop through one is the end user's
+  call.
 
-So the **human owner can curl `/admin` directly** with their own token, *and* the
-owner's backend can call it as a workload — neither requires naming an owner in the
-manifest.
+So the owner signs in to the service and uses `/admin`, and nothing names an owner
+in the manifest. A bare platform token (the one you deploy with) is refused at the
+edge (`403 app_plane_requires_app_credential`) before this module runs.
 
 ```mermaid
 flowchart TD
     C["caller hits /admin/* (authenticated)"] --> RO{"require_operator():
     caller_is_service_owner()?
-    (owner's agent OR own workload)"}
-    RO -->|no, and not an owner-backend OBO actor| D2["403"]
+    (the owner, signed in)"}
+    RO -->|no| D2["403"]
     RO -->|yes| OK["operator: list-all / block / cancel"]
 ```
 
@@ -331,7 +333,7 @@ flowchart TD
 - **End-user isolation:** reads are scoped to `auth::current_principal()`; missing
   and not-owned both `404`.
 - **Operator access by host-attested `caller_is_service_owner`** (above) — not a
-  manifest identity; the owner's agent token and own workloads both qualify.
+  manifest identity; only the owner, signed in, qualifies — no service does.
 - **Sender blocking:** a blocked principal's `/send` returns `403` before any row
   is written.
 - **Untrusted provider output is bounded:** a non-2xx Resend body is truncated to
@@ -372,13 +374,16 @@ curl -X POST https://<service-address>/send/batch \
        "recipients":[{"to":"a@x.com","vars":[["name","A"]]},{"to":"b@y.com","vars":[["name","B"]]}]}'
 # → 200 {"items":[...],"count":2,"accepted":2,"rejected":0}
 
-# Operator surface (/admin/*) — the SERVICE OWNER curls it directly with their
-# own token (the host attests caller_is_service_owner host-side). Block a sender:
-curl -X POST https://<service-address>/admin/blocks \
-  -H "authorization: Bearer <owner-token>" -H 'content-type: application/json' \
-  -d '{"principal":"agent_018f...","reason":"abuse"}'
-# A non-owner gets 403. The owner's own backend can also call it as a workload
-# (over peer) — neither path hardcodes an identity in the manifest.
+# Operator surface (/admin/*) — the SERVICE OWNER, signed in to this service.
+# Open this in your browser; after signing in it lands on the message list:
+#   https://<service-address>/boogy/signin?redirect=/admin/messages
+# Then, from that page's console (same origin, so the session cookie rides along),
+# block a sender:
+#   await fetch('/admin/blocks', { method: 'POST',
+#     headers: { 'content-type': 'application/json' },
+#     body: JSON.stringify({ principal: 'agent_018f...', reason: 'abuse' }) })
+# Anyone else gets 403: another person, any service (yours included), and a bare
+# platform token, which the edge refuses before this module runs.
 ```
 
 ---

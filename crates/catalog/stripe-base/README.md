@@ -426,7 +426,7 @@ identity and compares it to the service owner — no hardcoded id, correct for
 | Caller | `audience()` | Sees |
 |--------|-------------|------|
 | One of **your** apps (attested `boogy://<you>/services/<app>`) | `ClientApp(app)` | only that app's partition |
-| **You** (your agent, attested by `caller_is_service_owner`) | `Owner` | all your apps (`?client=` to filter) |
+| **You**, signed in to this service (attested by `caller_is_service_owner`) | `Owner` | all your apps (`?client=` to filter) |
 | A **different** owner's workload, a non-owner agent, or anon | `Denied` | `403` |
 
 So `POST /checkout`, `GET /orders`, `GET /orders/{id}` are reachable by any

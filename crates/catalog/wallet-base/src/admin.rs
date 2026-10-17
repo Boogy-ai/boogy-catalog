@@ -28,18 +28,17 @@ use crate::{EVM_CHAIN, PolicyReq};
 
 // ─── Operator gate ────────────────────────────────────────────────────────────
 
-/// Operator gate: admit ONLY the service owner's agent (host-attested).
+/// Operator gate: admit ONLY the service owner, as a person (host-attested).
 ///
 /// `/admin` is a cross-principal surface (lists every principal's wallets, can
-/// tighten/loosen any principal's policy, block anyone), so it is AGENT-ONLY.
+/// tighten/loosen any principal's policy, block anyone), so no service may use
+/// it, not even one of the owner's own.
 ///
-/// `caller_is_service_owner()` is NOT sufficient on its own: it returns `true`
-/// for ANY workload whose owner segment equals this deployment's owner — i.e.
-/// every OTHER service the same owner deployed. So we first reject any attested
+/// `caller_is_service_owner()` already holds that line: it is false for every
+/// workload and every delegated call. The explicit refusal of any attested
 /// workload caller (principal OR OBO actor parses as a `boogy://…/services/…`
-/// URI) — even one of the owner's own apps — then require the owner's agent.
-/// This mirrors stripe-base's `audience()` (which admits owner-workloads as
-/// client apps; a fund-holding admin surface must not). Closes review #5.
+/// URI) stays as a second, local layer, so a fund-holding surface does not
+/// rest on one check. Closes review #5.
 pub fn require_owner() -> Result<(), ApiError> {
     let identity = crate::bindings::boogy::platform::auth::current_identity();
     let principal = identity.as_ref().map(|i| i.principal.as_str()).unwrap_or("");
@@ -48,7 +47,7 @@ pub fn require_owner() -> Result<(), ApiError> {
         // An attested workload (even a sibling owner-workload) is never an operator.
         return Err(ApiError::forbidden("operator (service owner) access required"));
     }
-    // No attested workload → an agent. Only the service owner's agent qualifies.
+    // No attested workload → a person. Only the service owner qualifies.
     if crate::caller_is_service_owner() {
         Ok(())
     } else {

@@ -33,9 +33,8 @@ methods = ["*"]
 # surface (/admin/*) needs no per-route ingress override and NO hardcoded
 # identity (the module is provisionable by anyone): the handler gates it with
 # require_operator(), which uses the host-attested `caller_is_service_owner`
-# capability to admit the service owner — their own agent token (resolved
-# host-side) OR one of their own workloads. So the human owner can curl /admin
-# directly, and the owner's backend can call it over peer.
+# capability to admit the service owner as a person, signed in to this service.
+# No service is the operator, not even one under the owner's account.
 mode = "authenticated"
 
 [capabilities]

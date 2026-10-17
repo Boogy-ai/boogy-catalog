@@ -36,8 +36,9 @@ use models::{AdminAudit, Comment, Config, Member, Proposal, ProposalAction, Spon
 /// The caller's audience for this deployment — host-attested, hardcodes NO
 /// identity (the module is provisionable by anyone).
 ///
-/// - `Owner` — the SERVICE OWNER's agent (`caller_is_service_owner()`): config,
-///   moderation, guardian-cancel, `/admin/*`.
+/// - `Owner` — the SERVICE OWNER as a person, signed in
+///   (`caller_is_service_owner()`; no service is the owner, not even one under
+///   the owner's account): config, moderation, guardian-cancel, `/admin/*`.
 /// - `Voter(principal)` — an eligible participant per `Config.eligibility`:
 ///   propose / sponsor / vote / comment.
 /// - `Reader` — an anonymous caller on a read route (allowed only when
@@ -59,37 +60,9 @@ pub fn audience() -> Audience {
     if caller_is_service_owner() {
         return Audience::Owner;
     }
-    // The OBO arm — the same one `resend-base::require_operator` carries, and
-    // for the same reason. `caller_is_service_owner()` attests the owner's
-    // agent or their own DIRECT workload call; an on-behalf-of call from the
-    // owner's own backend is neither, because its PRINCIPAL is the delegated
-    // user. Without this the operator's backend fell through to
-    // `current_principal()` and, under `eligibility = "open"`, became an
-    // ordinary `Voter` — a silent downgrade rather than a refusal, which is
-    // worse than either: the call succeeded with the wrong authority.
-    //
-    // `identity.actor` is host-attested and set only on a delegated call, so
-    // a guest cannot reach this arm by asserting anything.
-    //
-    // WHAT THIS ARM ATTESTS, AND WHAT IT DOES NOT. `Owner` here is a
-    // GOVERNANCE authority, not an admin convenience: it configures the space,
-    // moderates, cancels as guardian and skips co-sponsorship — strictly
-    // higher-stakes than a plain `/admin` gate elsewhere in the catalog. The
-    // fact being attested is **"the owner's own workload made this call"**,
-    // never "the owner decided". The PRINCIPAL on a delegated call is the end
-    // user; the authority comes entirely from the actor. So an operator whose
-    // backend calls on a user's behalf is acting as the operator, and a
-    // decision recorded from this arm must not be read back as the user's
-    // consent to it. The predicate's own arms are unit-tested in
-    // `govern-base-core`; this composition — the arm order, the self-identity
-    // it compares against, and the fall-through to `Voter` — has an
-    // end-to-end test of its own, because the original defect was a
-    // composition defect and not a predicate one.
-    let identity = bindings::boogy::platform::auth::current_identity();
-    let actor = identity.as_ref().and_then(|i| i.actor.as_deref());
-    if govern_base_core::actor_is_owner_workload(actor, &self_identity().owner) {
-        return Audience::Owner;
-    }
+    // No service is the owner: not the owner's own backend, and not an
+    // on-behalf-of call it makes. Such a call is the delegated user's, and gets
+    // the audience that user would get calling directly (below).
     match auth::current_principal() {
         Some(p) => {
             let cfg = admin::load_config();

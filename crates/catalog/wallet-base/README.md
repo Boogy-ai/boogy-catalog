@@ -123,7 +123,7 @@ Mounted at `/mcp`. Tools: `get_address`, `get_balance`, `estimate_fee`, `simulat
 
 ### Operator admin (`/admin/*`)
 
-Requires the service owner's agent token. Endpoints: list all wallets/transactions, get/set any principal's policy, block/unblock a principal, view the audit log.
+Requires the service owner, signed in to this service; no service passes, not even one of the owner's. Endpoints: list all wallets/transactions, get/set any principal's policy, block/unblock a principal, view the audit log.
 
 ---
 

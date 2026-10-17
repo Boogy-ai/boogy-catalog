@@ -21,19 +21,21 @@ send email, manage templates, and (as the operator) administer everyone's mail.
 
 ## Caller contract — who calls, and how
 
-All calls arrive over `peer::fetch` from your own backend. Three shapes:
+Sending calls arrive over `peer::fetch` from your own backend; the operator
+surface is you, signed in. Three shapes:
 
 | You are calling… | Identity the module sees | Use it for |
 |---|---|---|
 | on behalf of a user (OBO) | `principal = agent_<user>`, `actor = boogy://<you>/services/<svc>` | user-triggered mail (welcome, receipt) — the message is owned by that user |
 | as your service | `principal = boogy://<you>/services/<svc>` | system mail |
-| as the operator | a workload you own (or an OBO hop from one), or YOU after signing in to this service | the `/admin/*` surface |
+| as the operator | YOU, signed in to this service (an app session) | the `/admin/*` surface |
 
 End-user routes are scoped to `principal` (each sender sees only their own
-mail). The operator surface admits **the service owner**: your backend calls it
-as a workload you own, or you reach it yourself once you have signed in to this
-service — an app session, where the host resolves your real account behind the
-per-service pairwise mask (`caller_is_service_owner`). **A bare platform
+mail). The operator surface admits **the service owner as a person**: you reach
+it once you have signed in to this service — an app session, where the host
+resolves your real account behind the per-service pairwise mask
+(`caller_is_service_owner`). No service is the operator, not even one of yours:
+any module you install runs as one of your workloads. **A bare platform
 credential does not work**: `/admin/*` ingress is `authenticated`, and the token
 you deploy or run the console with is refused at the edge with
 `403 app_plane_requires_app_credential` before this module runs. No identity is
