@@ -11,7 +11,7 @@ fn address_derivation_matches_eip155_key() {
         "4646464646464646464646464646464646464646464646464646464646464646").unwrap();
     let sk = SigningKey::from_slice(&sk_bytes).unwrap();
     let vk = sk.verifying_key();
-    let pubkey = vk.to_encoded_point(false); // uncompressed 0x04||X||Y, 65 bytes
+    let pubkey = vk.to_sec1_point(false); // uncompressed 0x04||X||Y, 65 bytes
     let adapter = wallet_base_core::evm::EvmAdapter;
     let addr = <wallet_base_core::evm::EvmAdapter as wallet_base_core::types::ChainAdapter>
         ::derive_address(&adapter, pubkey.as_bytes()).unwrap();
@@ -227,7 +227,7 @@ fn eip155_self_verify_accepts_correct_signer() {
     )
     .unwrap();
     let from = EvmAdapter
-        .derive_address(sk.verifying_key().to_encoded_point(false).as_bytes())
+        .derive_address(sk.verifying_key().to_sec1_point(false).as_bytes())
         .unwrap();
 
     let mut intent = eip155_legacy_intent();
@@ -255,4 +255,116 @@ fn eip155_self_verify_rejects_wrong_signer() {
         ChainAdapter::assemble_signed(&EvmAdapter, &unsigned, &[eip155_example_sig()]).is_err(),
         "#15: a signature recovering to a different account is rejected"
     );
+}
+
+// ---------------------------------------------------------------------------
+// EIP-1559 and EIP-2930 known answers from an independent implementation
+// ---------------------------------------------------------------------------
+//
+// viem (wevm/viem, main), `src/utils/transaction/serializeTransaction.test.ts`:
+// `base = { to: accounts[1].address, nonce: 785, value: parseEther('1') }` on
+// chain 1, no gas field (gas 0). The `signed` cases are signed by viem with
+// the Anvil/Hardhat development key `accounts[0]`
+// (0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266). Hex strings verbatim.
+
+const VIEM_TO: &str = "0x70997970c51812dc3a010c7d01b50e0d17dc79c8";
+const VIEM_SIGNER: &str = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+/// eip1559 `default`: maxFeePerGas = maxPriorityFeePerGas = 2 gwei.
+const VIEM_1559_UNSIGNED: &str =
+    "02ef0182031184773594008477359400809470997970c51812dc3a010c7d01b50e0d17dc79c8880de0b6b3a764000080c0";
+/// eip1559 `signed`.
+const VIEM_1559_SIGNED: &str = "02f8720182031184773594008477359400809470997970c51812dc3a010c7d01b50e0d17dc79c8880de0b6b3a764000080c001a0ce18214ff9d06ecaacb61811f9d6dc2be922e8cebddeaf6df0b30d5c498f6d33a05f0487c6dbbf2139f7c705d8054dbb16ecac8ae6256ce2c4c6f2e7ef35b3a496";
+/// eip2930 `default`: gasPrice 2 gwei, one access-list entry.
+const VIEM_2930_UNSIGNED: &str = "01f863018203118477359400809470997970c51812dc3a010c7d01b50e0d17dc79c8880de0b6b3a764000080f838f7941234512345123451234512345123451234512345e1a060fdd29ff912ce880cd3edaf9f932dc61d3dae823ea77e0323f94adb9f6a72fe";
+/// eip2930 `signed`.
+const VIEM_2930_SIGNED: &str = "01f8a6018203118477359400809470997970c51812dc3a010c7d01b50e0d17dc79c8880de0b6b3a764000080f838f7941234512345123451234512345123451234512345e1a060fdd29ff912ce880cd3edaf9f932dc61d3dae823ea77e0323f94adb9f6a72fe01a0dc7b3483c0b183823f07d77247c60678d861080acdc4fb8b9fd131770b475c40a040f16567391132746735aff4d5a3fa5ae42ff3d5d538e341870e0259dc40741a";
+
+fn unhex(s: &str) -> Vec<u8> {
+    hex::decode(s).unwrap()
+}
+
+/// `(r, s, y_parity)` read from the tail of a signed typed transaction: the
+/// last 67 bytes are `y (1) | a0 r (33) | a0 s (33)`.
+fn tail_signature(signed: &[u8]) -> ([u8; 32], [u8; 32], u8) {
+    let t = &signed[signed.len() - 67..];
+    assert_eq!((t[1], t[34]), (0xa0, 0xa0), "32-byte r and s strings");
+    let y = match t[0] {
+        0x80 => 0,
+        0x01 => 1,
+        other => panic!("y parity byte {other:#x}"),
+    };
+    (t[2..34].try_into().unwrap(), t[35..67].try_into().unwrap(), y)
+}
+
+fn viem_1559_intent(from: &str) -> wallet_base_core::types::EvmIntent {
+    wallet_base_core::types::EvmIntent {
+        to: Some(VIEM_TO.into()),
+        from_address: from.into(),
+        value_wei: "1000000000000000000".into(),
+        data_hex: "".into(),
+        chain_id: 1,
+        nonce: Some(785),
+        max_fee_per_gas: Some("2000000000".into()),
+        max_priority_fee_per_gas: Some("2000000000".into()),
+        gas_limit: Some(0),
+        legacy: false,
+        gas_price: None,
+    }
+}
+
+/// Our EIP-1559 signing hash is keccak256 of viem's unsigned serialization.
+#[test]
+fn eip1559_signing_hash_matches_viem() {
+    use wallet_base_core::evm::EvmAdapter;
+    use wallet_base_core::types::*;
+    let unsigned = ChainAdapter::build_unsigned(&EvmAdapter, &viem_1559_intent(""), &ChainState::default()).unwrap();
+    let want = alloy_primitives::keccak256(unhex(VIEM_1559_UNSIGNED));
+    match &unsigned.sign_requests[..] {
+        [SignRequest::Digest(d)] => assert_eq!(hex::encode(d), hex::encode(want)),
+        other => panic!("expected one Digest, got {other:?}"),
+    }
+}
+
+/// viem's signature, assembled by our adapter (which recovers it to the
+/// wallet address before encoding), gives viem's signed RLP exactly.
+#[test]
+fn eip1559_signed_rlp_matches_viem() {
+    use wallet_base_core::evm::EvmAdapter;
+    use wallet_base_core::types::*;
+    let unsigned = ChainAdapter::build_unsigned(&EvmAdapter, &viem_1559_intent(VIEM_SIGNER), &ChainState::default()).unwrap();
+    let (r, s, recovery_id) = tail_signature(&unhex(VIEM_1559_SIGNED));
+    let raw = ChainAdapter::assemble_signed(&EvmAdapter, &unsigned, &[Secp256k1Signature { r, s, recovery_id }]).unwrap();
+    assert_eq!(hex::encode(&raw.0), VIEM_1559_SIGNED);
+}
+
+/// EIP-2930, at the dependency: the adapter builds legacy and EIP-1559 only,
+/// so this pins alloy's EIP-2930 signing preimage, hash and signed envelope
+/// against viem's, ahead of an alloy bump.
+#[test]
+fn eip2930_encoding_matches_viem_in_alloy() {
+    use alloy_consensus::{SignableTransaction, TxEip2930};
+    use alloy_eips::eip2718::Encodable2718;
+    use alloy_eips::eip2930::{AccessList, AccessListItem};
+    use alloy_primitives::{Address, Signature, TxKind, B256, U256};
+    let tx = TxEip2930 {
+        chain_id: 1,
+        nonce: 785,
+        gas_price: 2_000_000_000,
+        gas_limit: 0,
+        to: TxKind::Call(VIEM_TO.parse::<Address>().unwrap()),
+        value: U256::from(1_000_000_000_000_000_000u128),
+        access_list: AccessList(vec![AccessListItem {
+            address: "0x1234512345123451234512345123451234512345".parse().unwrap(),
+            storage_keys: vec!["0x60fdd29ff912ce880cd3edaf9f932dc61d3dae823ea77e0323f94adb9f6a72fe".parse::<B256>().unwrap()],
+        }]),
+        input: Default::default(),
+    };
+    let mut preimage = Vec::new();
+    tx.encode_for_signing(&mut preimage);
+    assert_eq!(hex::encode(&preimage), VIEM_2930_UNSIGNED);
+    assert_eq!(tx.signature_hash(), alloy_primitives::keccak256(unhex(VIEM_2930_UNSIGNED)));
+    let (r, s, y) = tail_signature(&unhex(VIEM_2930_SIGNED));
+    let sig = Signature::new(U256::from_be_slice(&r), U256::from_be_slice(&s), y == 1);
+    assert_eq!(hex::encode(tx.into_signed(sig).encoded_2718()), VIEM_2930_SIGNED);
 }

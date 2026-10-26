@@ -9,7 +9,8 @@
 //!     lacks rich published end-to-end vectors; this guards encoding stability
 //!     across crate revs. The assemble round-trip below covers byte-correctness.
 //!  3. Assemble round-trip + adversarial: splice a raw 64-byte Ed25519 sig,
-//!     bincode-decode the Transaction back, assert signature + message survive;
+//!     check the wire layout and decode the message back, assert signature +
+//!     message survive;
 //!     reject wrong sig length / bad base58 / non-hex / wrong-length pubkey.
 
 use wallet_base_core::solana::{SolanaAdapter, SolanaIntent};
@@ -80,8 +81,6 @@ fn solana_build_unsigned_matches_message_snapshot() {
 
 #[test]
 fn solana_assemble_roundtrips_into_transaction() {
-    use solana_transaction::Transaction;
-
     use ed25519_dalek::{Signer, SigningKey};
 
     // A REAL Ed25519 keypair; the intent's `from` is its pubkey so the signature
@@ -97,20 +96,13 @@ fn solana_assemble_roundtrips_into_transaction() {
     let sig = sk.sign(&unsigned.preimage).to_bytes();
     let raw: RawTx = SolanaAdapter::assemble_signed(&unsigned, &sig).unwrap();
 
-    // Decode the Transaction back and assert structure survives.
-    let decoded: Transaction = bincode::deserialize(&raw.0).unwrap();
-    assert_eq!(decoded.signatures.len(), 1, "exactly one signature slot");
-    assert_eq!(
-        decoded.signatures[0].as_ref(),
-        &sig[..],
-        "raw 64-byte sig spliced verbatim into slot 0"
-    );
-    // The signed message matches the preimage we built from.
-    assert_eq!(
-        decoded.message.serialize(),
-        unsigned.preimage,
-        "message preserved through assemble"
-    );
+    // The wire layout: one signature (compact-u16 1), the raw 64-byte sig,
+    // then the message exactly as signed, which decodes back to itself.
+    assert_eq!(raw.0[0], 1, "exactly one signature slot");
+    assert_eq!(&raw.0[1..65], &sig[..], "raw 64-byte sig spliced verbatim into slot 0");
+    assert_eq!(&raw.0[65..], &unsigned.preimage[..], "message preserved through assemble");
+    let decoded: solana_message::Message = wincode::deserialize(&raw.0[65..]).unwrap();
+    assert_eq!(decoded.serialize(), unsigned.preimage);
 }
 
 #[test]
@@ -154,4 +146,69 @@ fn solana_build_unsigned_rejects_bad_from_pubkey() {
     let mut long = fixture_intent();
     long.from_pubkey_hex = hex::encode([0x42u8; 33]);
     assert!(SolanaAdapter::build_unsigned(&long).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// 4. Known-answer test from an independent implementation
+// ---------------------------------------------------------------------------
+
+/// solana-web3.js (maintenance/v1.x), `test/transaction.test.ts`, "serialize
+/// unsigned transaction" and "parse wire format and serialize": a
+/// `SystemProgram.transfer` of 49 lamports from `Keypair.fromSeed([8; 32])` to
+/// `J3dxNj7nDRRqRRXuEMynDG57DkZK4jYRuv3Garmb1i99`, recent blockhash
+/// `EETubP5AKHgjPAhzPAFcb8BAY1hMH639CWCFTqi3hq1k`, fee payer the sender. The
+/// two base64 strings are web3.js's expected wire bytes, verbatim: unsigned (a
+/// zeroed signature slot) and signed by web3.js.
+const WEB3JS_UNSIGNED_B64: &str = concat!(
+    "AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAAAABAAEDE5j2LG0aRXxRumpLXz29L2n8qTIWIY3ImX5Ba9F9k8r9",
+    "Q5/Mtmcn8onFxt47xKj+XdXXd3C8j/FcPu7csUrz/AAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    "AAAAAAAAAAAAAAAAxJrndgN4IFTxep3s6kO0ROug7bEsbx0xxuDkqEvwUusBAgIAAQwC",
+    "AAAAMQAAAAAAAAA=",
+);
+const WEB3JS_SIGNED_B64: &str = concat!(
+    "AVuErQHaXv0SG0/PchunfxHKt8wMRfMZzqV0tkC5qO6owYxWU2v871AoWywGoFQr4z+q/7mE8lIufNl/",
+    "kxj+nQ0BAAEDE5j2LG0aRXxRumpLXz29L2n8qTIWIY3ImX5Ba9F9k8r9Q5/Mtmcn8onFxt47xKj+XdXX",
+    "d3C8j/FcPu7csUrz/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAxJrndgN4IFTxep3s6kO0",
+    "ROug7bEsbx0xxuDkqEvwUusBAgIAAQwCAAAAMQAAAAAAAAA=",
+);
+
+fn b64(s: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.decode(s).unwrap()
+}
+
+fn web3js_intent() -> SolanaIntent {
+    let sender = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32]);
+    SolanaIntent {
+        from_pubkey_hex: hex::encode(sender.verifying_key().to_bytes()),
+        to_address: "J3dxNj7nDRRqRRXuEMynDG57DkZK4jYRuv3Garmb1i99".into(),
+        lamports: 49,
+        recent_blockhash: "EETubP5AKHgjPAhzPAFcb8BAY1hMH639CWCFTqi3hq1k".into(),
+    }
+}
+
+/// Our serialized Message, the exact Ed25519 sign input, is byte-identical to
+/// web3.js's: the wire bytes after the one-entry signature section.
+#[test]
+fn solana_message_matches_web3js() {
+    let unsigned = SolanaAdapter::build_unsigned(&web3js_intent()).unwrap();
+    let wire = b64(WEB3JS_UNSIGNED_B64);
+    assert_eq!(wire[0], 1, "one signature slot");
+    assert_eq!(hex::encode(&unsigned.preimage), hex::encode(&wire[65..]));
+    match &unsigned.sign_requests[..] {
+        [SignRequest::Message(m)] => assert_eq!(m, &unsigned.preimage),
+        other => panic!("expected one Message sign request, got {other:?}"),
+    }
+}
+
+/// web3.js's signature, spliced by our assembler (which self-verifies it
+/// against our message), gives web3.js's signed wire bytes exactly.
+#[test]
+fn solana_signed_transaction_matches_web3js() {
+    let unsigned = SolanaAdapter::build_unsigned(&web3js_intent()).unwrap();
+    let signed = b64(WEB3JS_SIGNED_B64);
+    let sig: [u8; 64] = signed[1..65].try_into().unwrap();
+    let raw: RawTx = SolanaAdapter::assemble_signed(&unsigned, &sig).unwrap();
+    assert_eq!(hex::encode(&raw.0), hex::encode(&signed));
 }

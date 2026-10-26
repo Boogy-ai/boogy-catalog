@@ -1,26 +1,31 @@
 //! Cosmos SignDoc build + TxRaw assemble (SIGN_MODE_DIRECT, host-signed).
 //!
-//! Pinned cosmrs 0.22 encoding API actually used here:
-//!   - `cosmrs::tx::Body::into_bytes(self) -> Result<Vec<u8>>`
-//!   - `cosmrs::tx::AuthInfo::into_bytes(self) -> Result<Vec<u8>>`
-//!   - `cosmrs::tx::SignDoc::new(&body, &auth_info, &chain_id, account_number)?`
-//!     then `.into_bytes() -> Result<Vec<u8>>`
-//!   - TxRaw proto: `cosmrs::proto::cosmos::tx::v1beta1::TxRaw`
-//!     (re-exported from `cosmos_sdk_proto`)
-//!   - prost encode: `cosmrs::proto::traits::Message::encode_to_vec(&txraw)`
-//!     (`Message` is `cosmrs::proto::prost::Message`, re-exported via
-//!     `cosmrs::proto::traits`)
+//! The protobuf messages come from `cosmos-sdk-proto` and are encoded with
+//! prost; nothing here signs. The input checks are the ones the chain applies
+//! to the same fields:
+//!   - an address is BIP-173 bech32 (not bech32m) in one case, with a
+//!     lowercase alphanumeric prefix and 1..=255 bytes, zero padding, and is
+//!     re-encoded lowercase;
+//!   - a denom is 3..=128 of `[A-Za-z0-9/:._-]`;
+//!   - a chain id is 1..=50 of `[A-Za-z0-9._-]`;
+//!   - the pubkey is a valid secp256k1 point, carried compressed.
+//!
+//! `tests/cosmos_vectors.rs` pins the output: cosmjs's published
+//! SIGN_MODE_DIRECT vector byte for byte, the SignDoc snapshot, and an
+//! independent hand-encoding of the SignDoc framing.
 
 use super::CosmosIntent;
 use crate::types::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use cosmrs::bank::MsgSend;
-use cosmrs::crypto::PublicKey;
-use cosmrs::proto::traits::Message; // brings `encode_to_vec` into scope
-use cosmrs::tx::{Body, Fee, Msg, SignDoc, SignerInfo};
-use cosmrs::{AccountId, Coin};
+use cosmos_sdk_proto::cosmos::bank::v1beta1::MsgSend;
+use cosmos_sdk_proto::cosmos::base::v1beta1::Coin;
+use cosmos_sdk_proto::cosmos::crypto::secp256k1::PubKey;
+use cosmos_sdk_proto::cosmos::tx::signing::v1beta1::SignMode;
+use cosmos_sdk_proto::cosmos::tx::v1beta1::{mode_info, AuthInfo, Fee, ModeInfo, SignDoc, SignerInfo, TxBody, TxRaw};
+use cosmos_sdk_proto::prost::{Message, Name};
+use cosmos_sdk_proto::Any;
 
 /// Resolved proto bytes carried in `Unsigned.preimage`, so `assemble_signed`
 /// rebuilds `TxRaw` directly without re-deriving the body/auth_info.
@@ -44,26 +49,54 @@ fn parse_u128_decimal(s: &str, field: &str) -> Result<u128, AdapterError> {
         .map_err(|e| AdapterError::BadIntent(format!("invalid decimal {field}: {e}")))
 }
 
-fn parse_account_id(s: &str, field: &str) -> Result<AccountId, AdapterError> {
-    s.parse::<AccountId>()
-        .map_err(|e| AdapterError::BadIntent(format!("invalid {field} address: {e}")))
+/// A bech32 account address, re-encoded in lowercase.
+fn parse_account_id(s: &str, field: &str) -> Result<String, AdapterError> {
+    use bech32::primitives::decode::CheckedHrpstring;
+    let bad = |why: String| AdapterError::BadIntent(format!("invalid {field} address: {why}"));
+    let checked = CheckedHrpstring::new::<bech32::Bech32>(s).map_err(|e| bad(e.to_string()))?;
+    checked.validate_segwit_padding().map_err(|e| bad(e.to_string()))?;
+    let prefix = checked.hrp().to_lowercase();
+    if !prefix.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9')) {
+        return Err(bad("expected prefix to be lowercase alphanumeric characters only".into()));
+    }
+    let bytes: Vec<u8> = checked.byte_iter().collect();
+    if !(1..=255).contains(&bytes.len()) {
+        return Err(bad(format!("account ID should be 1 to 255 bytes long, but was {} bytes long", bytes.len())));
+    }
+    bech32::encode::<bech32::Bech32>(checked.hrp(), &bytes).map_err(|e| bad(e.to_string()))
 }
 
 fn parse_coin(amount: &str, denom: &str, field: &str) -> Result<Coin, AdapterError> {
     let amt = parse_u128_decimal(amount, field)?;
-    let denom = denom
-        .parse()
-        .map_err(|e| AdapterError::BadIntent(format!("invalid {field} denom: {e}")))?;
-    Ok(Coin { denom, amount: amt })
+    let valid = (3..=128).contains(&denom.len())
+        && denom.chars().all(|c| matches!(c, 'A'..='Z' | 'a'..='z' | '0'..='9' | '/' | ':' | '.' | '_' | '-'));
+    if !valid {
+        return Err(AdapterError::BadIntent(format!("invalid {field} denom: {denom}")));
+    }
+    Ok(Coin { denom: denom.to_string(), amount: amt.to_string() })
+}
+
+fn parse_chain_id(s: &str) -> Result<String, AdapterError> {
+    let valid = (1..=50).contains(&s.len())
+        && s.bytes().all(|b| matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.'));
+    if !valid {
+        return Err(AdapterError::BadIntent(format!("invalid chain_id: {s}")));
+    }
+    Ok(s.to_string())
+}
+
+fn any_of<M: Name>(msg: &M) -> Any {
+    Any { type_url: M::type_url(), value: msg.encode_to_vec() }
 }
 
 pub fn build_unsigned(intent: &CosmosIntent) -> Result<Unsigned, AdapterError> {
-    // Pubkey: 33-byte compressed hex → k256 VerifyingKey → cosmrs PublicKey.
+    // Pubkey: 33-byte compressed hex (or a 65-byte uncompressed point),
+    // checked on the curve and carried compressed.
     let pk_bytes = hex::decode(intent.pubkey_compressed_hex.trim())
         .map_err(|e| AdapterError::BadIntent(format!("invalid pubkey hex: {e}")))?;
     let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&pk_bytes)
         .map_err(|e| AdapterError::BadIntent(format!("invalid secp256k1 pubkey: {e}")))?;
-    let public_key = PublicKey::from(vk);
+    let public_key = any_of(&PubKey { key: vk.to_sec1_point(true).as_bytes().to_vec() });
 
     let from = parse_account_id(&intent.from_address, "from")?;
     let to = parse_account_id(&intent.to_address, "to")?;
@@ -71,40 +104,32 @@ pub fn build_unsigned(intent: &CosmosIntent) -> Result<Unsigned, AdapterError> {
     let send_coin = parse_coin(&intent.amount, &intent.denom, "amount")?;
     let fee_coin = parse_coin(&intent.fee_amount, &intent.fee_denom, "fee")?;
 
-    let msg = MsgSend {
-        from_address: from,
-        to_address: to,
-        amount: vec![send_coin],
+    let msg = MsgSend { from_address: from, to_address: to, amount: vec![send_coin] };
+
+    let body = TxBody { messages: vec![any_of(&msg)], memo: intent.memo.clone(), ..Default::default() };
+
+    let signer_info = SignerInfo {
+        public_key: Some(public_key),
+        mode_info: Some(ModeInfo { sum: Some(mode_info::Sum::Single(mode_info::Single { mode: SignMode::Direct as i32 })) }),
+        sequence: intent.sequence,
     };
-    let any = msg
-        .to_any()
-        .map_err(|e| AdapterError::Encoding(format!("encode MsgSend: {e}")))?;
+    let auth_info = AuthInfo {
+        signer_infos: vec![signer_info],
+        fee: Some(Fee { amount: vec![fee_coin], gas_limit: intent.gas_limit, ..Default::default() }),
+        ..Default::default()
+    };
 
-    let body = Body::new(vec![any], intent.memo.clone(), 0u16);
+    let chain_id = parse_chain_id(&intent.chain_id)?;
 
-    let signer_info = SignerInfo::single_direct(Some(public_key), intent.sequence);
-    let auth_info = signer_info.auth_info(Fee::from_amount_and_gas(fee_coin, intent.gas_limit));
-
-    let chain_id = intent
-        .chain_id
-        .parse()
-        .map_err(|e| AdapterError::BadIntent(format!("invalid chain_id: {e}")))?;
-
-    // SignDoc::new borrows body/auth_info; clones below are consumed by
-    // into_bytes (which take self) to capture the canonical proto bytes.
-    let sign_doc = SignDoc::new(&body, &auth_info, &chain_id, intent.account_number)
-        .map_err(|e| AdapterError::Encoding(format!("build SignDoc: {e}")))?;
-    let sign_bytes = sign_doc
-        .into_bytes()
-        .map_err(|e| AdapterError::Encoding(format!("encode SignDoc: {e}")))?;
-    let digest: [u8; 32] = Sha256::digest(&sign_bytes).into();
-
-    let body_bytes = body
-        .into_bytes()
-        .map_err(|e| AdapterError::Encoding(format!("encode body: {e}")))?;
-    let auth_info_bytes = auth_info
-        .into_bytes()
-        .map_err(|e| AdapterError::Encoding(format!("encode auth_info: {e}")))?;
+    let body_bytes = body.encode_to_vec();
+    let auth_info_bytes = auth_info.encode_to_vec();
+    let sign_doc = SignDoc {
+        body_bytes: body_bytes.clone(),
+        auth_info_bytes: auth_info_bytes.clone(),
+        chain_id,
+        account_number: intent.account_number,
+    };
+    let digest: [u8; 32] = Sha256::digest(sign_doc.encode_to_vec()).into();
 
     let resolved = ResolvedCosmosTx {
         body_bytes,
@@ -196,7 +221,7 @@ pub fn assemble_for_simulation(
 }
 
 fn encode_txraw(resolved: &ResolvedCosmosTx, signature: Vec<u8>) -> Result<RawTx, AdapterError> {
-    let txraw = cosmrs::proto::cosmos::tx::v1beta1::TxRaw {
+    let txraw = TxRaw {
         body_bytes: resolved.body_bytes.clone(),
         auth_info_bytes: resolved.auth_info_bytes.clone(),
         signatures: vec![signature],
@@ -209,6 +234,41 @@ mod tests {
     use super::*;
     use crate::cosmos::CosmosAdapter;
 
+    /// The rules cosmrs applied before the proto types replaced it: BIP-173
+    /// bech32 in one case, re-encoded lowercase; a lowercase alphanumeric
+    /// prefix; 1..=255 bytes.
+    #[test]
+    fn an_address_is_single_case_bech32_with_an_alphanumeric_prefix() {
+        let lower = "cosmos1pkptre7fdkl6gfrzlesjjvhxhlc3r4gmmk8rs6";
+        assert_eq!(parse_account_id(lower, "to").unwrap(), lower);
+        assert_eq!(parse_account_id(&lower.to_uppercase(), "to").unwrap(), lower);
+        let mixed = "Cosmos1pkptre7fdkl6gfrzlesjjvhxhlc3r4gmmk8rs6";
+        assert!(parse_account_id(mixed, "to").is_err());
+        let hrp = |h: &str| bech32::Hrp::parse(h).unwrap();
+        let bech32m = bech32::encode::<bech32::Bech32m>(hrp("cosmos"), &[7u8; 20]).unwrap();
+        assert!(parse_account_id(&bech32m, "to").is_err(), "bech32m is not an account address");
+        let odd_prefix = bech32::encode::<bech32::Bech32>(hrp("cos-mos"), &[7u8; 20]).unwrap();
+        assert!(parse_account_id(&odd_prefix, "to").is_err());
+        let empty = bech32::encode::<bech32::Bech32>(hrp("cosmos"), &[]).unwrap();
+        assert!(parse_account_id(&empty, "to").is_err());
+        let module = bech32::encode::<bech32::Bech32>(hrp("cosmos"), &[7u8; 32]).unwrap();
+        assert_eq!(parse_account_id(&module, "to").unwrap(), module);
+    }
+
+    #[test]
+    fn a_denom_and_a_chain_id_keep_cosmrs_and_tendermints_rules() {
+        assert!(parse_coin("1", "uatom", "amount").is_ok());
+        assert!(parse_coin("1", "ibc/27394FB092D2ECCD56123C74F36E4C1F926001CEADA9CA97EA622B25F41E5EB2", "amount").is_ok());
+        assert!(parse_coin("1", "ua", "amount").is_err());
+        assert!(parse_coin("1", "u atom", "amount").is_err());
+        assert!(parse_coin("1", &"a".repeat(129), "amount").is_err());
+        assert_eq!(parse_coin("1000000", "uatom", "amount").unwrap().amount, "1000000");
+        assert!(parse_chain_id("cosmoshub-4").is_ok());
+        assert!(parse_chain_id("").is_err());
+        assert!(parse_chain_id(&"c".repeat(51)).is_err());
+        assert!(parse_chain_id("cosmos hub").is_err());
+    }
+
     fn test_pubkey_hex() -> String {
         use k256::ecdsa::SigningKey;
         let sk = SigningKey::from_slice(
@@ -216,7 +276,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        hex::encode(sk.verifying_key().to_encoded_point(true).as_bytes())
+        hex::encode(sk.verifying_key().to_sec1_point(true).as_bytes())
     }
 
     fn fixture_intent() -> CosmosIntent {

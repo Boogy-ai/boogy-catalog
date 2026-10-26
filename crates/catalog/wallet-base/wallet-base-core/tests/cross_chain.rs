@@ -44,7 +44,7 @@ fn test_compressed_pubkey() -> Vec<u8> {
     use k256::ecdsa::SigningKey;
     let sk_bytes = hex::decode(TEST_SK_HEX).unwrap();
     let sk = SigningKey::from_slice(&sk_bytes).unwrap();
-    sk.verifying_key().to_encoded_point(true).as_bytes().to_vec()
+    sk.verifying_key().to_sec1_point(true).as_bytes().to_vec()
 }
 
 /// A fully-specified EIP-1559 EVM transfer (nonce + fees + gas all provided so
@@ -217,8 +217,8 @@ fn each_chain_digest_is_deterministic() {
 
 #[test]
 fn assemble_signed_is_bound_to_its_own_chain_encoding() {
-    use cosmrs::proto::cosmos::tx::v1beta1::TxRaw;
-    use cosmrs::proto::traits::Message;
+    use cosmos_sdk_proto::cosmos::tx::v1beta1::TxRaw;
+    use cosmos_sdk_proto::prost::Message;
 
     // Cosmos: assembling the Cosmos `Unsigned` with a single sig yields a decodable
     // protobuf `TxRaw` (64-byte compact r||s, no recovery id).

@@ -1,6 +1,7 @@
-//! Cosmos (cosmrs) chain adapter — host-signed mode.
+//! Cosmos chain adapter — host-signed mode.
 //!
-//! cosmrs is used ONLY for proto encoding (Body / AuthInfo / SignDoc / TxRaw);
+//! `cosmos-sdk-proto` is used ONLY for proto encoding (TxBody / AuthInfo /
+//! SignDoc / TxRaw);
 //! the private key never enters this crate. `build_unsigned` produces a 32-byte
 //! SHA-256 digest of the SignDoc (SIGN_MODE_DIRECT) for credops to sign;
 //! `assemble_signed` splices the returned 64-byte compact `r||s` signature into a

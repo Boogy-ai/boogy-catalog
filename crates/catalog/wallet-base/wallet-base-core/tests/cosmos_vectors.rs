@@ -1,17 +1,13 @@
-//! Cosmos (cosmrs) wasm-compat feasibility spike — address + SignDoc vectors.
+//! Cosmos address + SignDoc vectors.
 //!
-//! Two parts:
-//!  1. Address cross-check (authoritative): derive a compressed secp256k1 pubkey
-//!     from a fixed test private key, then compute the `cosmos1…` address TWO
-//!     ways — a hand-rolled `bech32("cosmos", ripemd160(sha256(pk)))` per the
-//!     Cosmos spec, and via cosmrs's `PublicKey::account_id("cosmos")` — and
-//!     assert they MATCH. This cross-checks cosmrs's derivation against the spec.
-//!  2. SignDoc digest (stability snapshot): build a minimal SIGN_MODE_DIRECT
-//!     SignDoc for a fixed bank MsgSend, encode it (`into_bytes()`), SHA-256, and
-//!     assert against a snapshot captured on first green run. Cosmos lacks the
-//!     rich published end-to-end digest vectors EVM has; the address cross-check
-//!     above is the authoritative part. The assemble round-trip in a later task
-//!     covers byte-correctness. This guards encoding stability across cosmrs revs.
+//!  1. Addresses: the spec algorithm `bech32("cosmos", ripemd160(sha256(pk)))`
+//!     and the adapter both give the address cosmrs 0.22 derived for the fixed
+//!     test key (recorded before cosmrs left the graph), and cosmjs's published
+//!     signer pubkey gives cosmjs's own address.
+//!  2. SignDoc: `build_unsigned`'s digest equals a recorded snapshot, an
+//!     independent hand-encoding of the SignDoc framing, and cosmjs's published
+//!     SIGN_MODE_DIRECT vector byte for byte (whose signature verifies against
+//!     our digest).
 
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
@@ -26,7 +22,7 @@ fn test_compressed_pubkey() -> Vec<u8> {
     let sk_bytes = hex::decode(TEST_SK_HEX).unwrap();
     let sk = SigningKey::from_slice(&sk_bytes).unwrap();
     let vk = sk.verifying_key();
-    vk.to_encoded_point(true).as_bytes().to_vec() // compressed 0x02/0x03 || X
+    vk.to_sec1_point(true).as_bytes().to_vec() // compressed 0x02/0x03 || X
 }
 
 /// Spec algorithm: cosmos address = bech32("cosmos", ripemd160(sha256(pubkey))).
@@ -37,79 +33,28 @@ fn cosmos_addr_spec(compressed_pubkey: &[u8]) -> String {
     bech32::encode::<bech32::Bech32>(hrp, &rip).unwrap()
 }
 
+/// RECORDED from cosmrs 0.22 (`PublicKey::account_id`) before it left the
+/// graph: the address of the fixed test key. Never re-blessed.
+const RECORDED_TEST_ADDRESS: &str = "cosmos1hkfq3zahaqkkzx5mjnamwjsfpq2jk7z0emlrvp";
+
+/// The address the spec algorithm and the adapter derive for the fixed test
+/// key is the one cosmrs derived, and cosmjs's `testVectors[0]` pubkey gives
+/// cosmjs's own signer address (an independent implementation's pair).
 #[test]
-fn cosmos_address_cross_checks_cosmrs_against_spec() {
-    use cosmrs::crypto::PublicKey;
-
-    let pk_bytes = test_compressed_pubkey();
-    assert_eq!(pk_bytes.len(), 33, "compressed pubkey must be 33 bytes");
-
-    // Way 1: hand-rolled spec algorithm.
-    let spec_addr = cosmos_addr_spec(&pk_bytes);
-    assert!(spec_addr.starts_with("cosmos1"), "got {spec_addr}");
-
-    // Way 2: via cosmrs.
-    let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&pk_bytes).unwrap();
-    let cosmrs_pk = PublicKey::from(vk);
-    let account_id = cosmrs_pk.account_id("cosmos").unwrap();
-    let cosmrs_addr = account_id.to_string();
-
-    assert_eq!(
-        spec_addr, cosmrs_addr,
-        "cosmrs address derivation must match the bech32(ripemd160(sha256(pk))) spec"
-    );
+fn cosmos_addresses_are_as_recorded_and_as_cosmjs() {
+    let pk = test_compressed_pubkey();
+    assert_eq!(cosmos_addr_spec(&pk), RECORDED_TEST_ADDRESS);
+    assert_eq!(CosmosAdapter::address_from_pubkey(&pk, "cosmos").unwrap(), RECORDED_TEST_ADDRESS);
+    let cosmjs = hex::decode("034f04181eeba35391b858633a765c4a0c189697b40d216354d50890d350c70290").unwrap();
+    assert_eq!(cosmos_addr_spec(&cosmjs), "cosmos1pkptre7fdkl6gfrzlesjjvhxhlc3r4gmmk8rs6");
+    assert_eq!(CosmosAdapter::address_from_pubkey(&cosmjs, "cosmos").unwrap(), "cosmos1pkptre7fdkl6gfrzlesjjvhxhlc3r4gmmk8rs6");
 }
 
-/// SHA-256 of the encoded SignDoc bytes for a fixed transaction — a stability
-/// snapshot (NOT a published vector; see module docs). Captured on first green run.
+/// SHA-256 of the encoded SignDoc bytes for [`fixture_intent`] — a stability
+/// snapshot, RECORDED from cosmrs 0.22's encoder (NOT a published vector; see
+/// module docs). Never re-blessed.
 const SIGNDOC_DIGEST_SNAPSHOT: &str =
     "e127e7360b8e5f82b808e7f21c1c6a2d0a8b0afed6c4340ae0cdc9270d51afb0";
-
-#[test]
-fn cosmos_signdoc_digest_is_stable() {
-    use cosmrs::bank::MsgSend;
-    use cosmrs::tx::{Body, Fee, Msg, SignDoc, SignerInfo};
-    use cosmrs::{AccountId, Coin};
-
-    let pk_bytes = test_compressed_pubkey();
-    let vk = k256::ecdsa::VerifyingKey::from_sec1_bytes(&pk_bytes).unwrap();
-    let sender_pk = cosmrs::crypto::PublicKey::from(vk);
-    let from: AccountId = sender_pk.account_id("cosmos").unwrap();
-
-    // Fixed recipient (a deterministic cosmos1 address).
-    let to: AccountId = "cosmos1qy352eufqy352eufqy352eufqy35qqqz9te5xt"
-        .parse()
-        .unwrap_or_else(|_| from.clone());
-
-    let amount = Coin {
-        denom: "uatom".parse().unwrap(),
-        amount: 1_000_000u128,
-    };
-
-    let msg = MsgSend {
-        from_address: from.clone(),
-        to_address: to,
-        amount: vec![amount.clone()],
-    };
-
-    let body = Body::new(vec![msg.to_any().unwrap()], "", 0u16);
-    let signer_info = SignerInfo::single_direct(Some(sender_pk), 0);
-    let auth_info = signer_info.auth_info(Fee::from_amount_and_gas(amount, 200_000u64));
-
-    let chain_id = "cosmoshub-4".parse().unwrap();
-    let sign_doc = SignDoc::new(&body, &auth_info, &chain_id, 1).unwrap();
-    let bytes = sign_doc.into_bytes().unwrap();
-
-    let digest = Sha256::digest(&bytes);
-    let digest_hex = hex::encode(digest);
-
-    // On first run, this will fail and print the actual digest — paste it into
-    // SIGNDOC_DIGEST_SNAPSHOT to lock the snapshot.
-    assert_eq!(
-        digest_hex, SIGNDOC_DIGEST_SNAPSHOT,
-        "SignDoc encoding changed (or snapshot not yet captured)"
-    );
-}
 
 // ---------------------------------------------------------------------------
 // CosmosAdapter: build_unsigned / assemble_signed KAT + round-trip + adversarial
@@ -161,8 +106,8 @@ fn cosmos_build_unsigned_matches_signdoc_snapshot() {
 
 #[test]
 fn cosmos_assemble_roundtrips_into_txraw() {
-    use cosmrs::proto::cosmos::tx::v1beta1::TxRaw;
-    use cosmrs::proto::traits::Message;
+    use cosmos_sdk_proto::cosmos::tx::v1beta1::TxRaw;
+    use cosmos_sdk_proto::prost::Message;
 
     let unsigned = CosmosAdapter::build_unsigned(&fixture_intent()).unwrap();
 
@@ -268,12 +213,12 @@ fn put_len_field(out: &mut Vec<u8>, field_no: u32, bytes: &[u8]) {
 /// #18 (independent in-repo derivation): the SIGN_MODE_DIRECT sign-bytes are
 /// `sha256(proto(SignDoc{body_bytes, auth_info_bytes, chain_id, account_number}))`.
 /// Re-encode that SignDoc HERE by the raw protobuf wire spec — a completely
-/// different code path than cosmrs's `SignDoc::into_bytes()` that `build_unsigned`
+/// different code path than the prost `SignDoc` encoding `build_unsigned`
 /// uses — and assert the digest matches. This catches a field-order / tag /
-/// varint / framing bug or a cosmrs encoding drift that the stability SNAPSHOT
+/// varint / framing bug or an encoder drift that the stability SNAPSHOT
 /// (`cosmos_build_unsigned_matches_signdoc_snapshot`) cannot, because the
 /// snapshot is captured from our own output. Not a full cross-impl KAT (the
-/// body/auth_info bytes still come from cosmrs) — see the external stub below.
+/// body/auth_info bytes still come from our encoder) — see the external stub below.
 #[test]
 fn cosmos_signdoc_framing_matches_independent_proto_encoding() {
     let intent = fixture_intent();

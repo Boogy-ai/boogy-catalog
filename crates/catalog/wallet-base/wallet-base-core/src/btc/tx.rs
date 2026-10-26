@@ -89,13 +89,7 @@ pub fn build_unsigned(intent: &BtcIntent) -> Result<Unsigned, AdapterError> {
     let sender_addr = bitcoin::Address::p2wpkh(&pk, intent.network.known_hrp());
     let sender_spk = sender_addr.script_pubkey();
 
-    // Validate the destination address FOR THIS NETWORK (a mainnet send to a
-    // tb1q… testnet address — or vice versa — fails closed here).
-    let to_addr = bitcoin::Address::from_str(intent.to_address.trim())
-        .map_err(|e| AdapterError::BadIntent(format!("invalid to_address: {e}")))?
-        .require_network(intent.network.network())
-        .map_err(|e| AdapterError::BadIntent(format!("to_address wrong network: {e}")))?;
-    let to_spk = to_addr.script_pubkey();
+    let to_spk = recipient_script_pubkey(&intent.to_address, intent.network)?;
 
     // Coin-select against amount + estimated fee (fail-closed on insufficient).
     let selection = select_coins(&intent.utxos, intent.amount_sat, intent.fee_rate_sat_vb)?;
@@ -138,19 +132,9 @@ pub fn build_unsigned(intent: &BtcIntent) -> Result<Unsigned, AdapterError> {
     // One BIP143 sighash per input (input order). Each input spends the
     // sender's own P2WPKH, so the prevout script is `sender_spk` and the prevout
     // value is the selected UTXO's amount (load-bearing in BIP143).
-    let mut cache = bitcoin::sighash::SighashCache::new(&unsigned_tx);
     let mut sign_requests: Vec<SignRequest> = Vec::with_capacity(selection.selected.len());
     for (i, u) in selection.selected.iter().enumerate() {
-        let sighash = cache
-            .p2wpkh_signature_hash(
-                i,
-                &sender_spk,
-                bitcoin::Amount::from_sat(u.value_sat),
-                bitcoin::EcdsaSighashType::All,
-            )
-            .map_err(|e| AdapterError::Encoding(format!("p2wpkh sighash input {i}: {e}")))?;
-        let digest: [u8; 32] = sighash.to_byte_array();
-        sign_requests.push(SignRequest::Digest(digest));
+        sign_requests.push(SignRequest::Digest(p2wpkh_sighash(&unsigned_tx, i, &pk, u.value_sat)?));
     }
 
     let resolved = ResolvedBtcTx {
@@ -164,6 +148,73 @@ pub fn build_unsigned(intent: &BtcIntent) -> Result<Unsigned, AdapterError> {
         preimage,
         sign_requests,
     })
+}
+
+/// A recipient address, valid FOR THIS NETWORK, as its script_pubkey. Any
+/// standard address type is a legal recipient (P2WPKH, P2WSH, P2TR, …); a
+/// mainnet send to a `tb1…` address, or vice versa, fails closed.
+pub fn recipient_script_pubkey(address: &str, network: super::BtcNetwork) -> Result<bitcoin::ScriptBuf, AdapterError> {
+    let addr = bitcoin::Address::from_str(address.trim())
+        .map_err(|e| AdapterError::BadIntent(format!("invalid to_address: {e}")))?
+        .require_network(network.network())
+        .map_err(|e| AdapterError::BadIntent(format!("to_address wrong network: {e}")))?;
+    Ok(addr.script_pubkey())
+}
+
+/// The BIP143 sighash (SIGHASH_ALL) of input `input` of `tx`, which spends a
+/// P2WPKH output of `pubkey` worth `value_sat`: the 32-byte digest its
+/// signature commits to.
+pub fn p2wpkh_sighash(
+    tx: &bitcoin::Transaction,
+    input: usize,
+    pubkey: &bitcoin::CompressedPublicKey,
+    value_sat: u64,
+) -> Result<[u8; 32], AdapterError> {
+    let spk = bitcoin::ScriptBuf::new_p2wpkh(&pubkey.wpubkey_hash());
+    let sighash = bitcoin::sighash::SighashCache::new(tx)
+        .p2wpkh_signature_hash(input, &spk, bitcoin::Amount::from_sat(value_sat), bitcoin::EcdsaSighashType::All)
+        .map_err(|e| AdapterError::Encoding(format!("p2wpkh sighash input {input}: {e}")))?;
+    Ok(sighash.to_byte_array())
+}
+
+/// Splice `sig` into input `input` of `tx` as its P2WPKH witness
+/// (`[der_sig || SIGHASH_ALL, pubkey]`), after normalizing it to low-S and
+/// verifying it against `digest` (that input's BIP143 sighash) under
+/// `pubkey`. A signature that does not verify is refused, never spliced.
+pub fn splice_p2wpkh_signature(
+    tx: &mut bitcoin::Transaction,
+    input: usize,
+    sig: &Secp256k1Signature,
+    pubkey: &bitcoin::secp256k1::PublicKey,
+    digest: &[u8; 32],
+) -> Result<(), AdapterError> {
+    // Rebuild the 64-byte compact r||s from the crate's signature type.
+    let mut compact = [0u8; 64];
+    compact[0..32].copy_from_slice(&sig.r);
+    compact[32..64].copy_from_slice(&sig.s);
+    let mut secp_sig = bitcoin::secp256k1::ecdsa::Signature::from_compact(&compact)
+        .map_err(|e| AdapterError::Encoding(format!("invalid compact sig input {input}: {e}")))?;
+    // BIP62 low-S: enforce in place, always (network policy rejects high-S).
+    secp_sig.normalize_s();
+
+    // SELF-VERIFY (#7): the signature MUST validate against this input's
+    // BIP143 sighash under the sender's pubkey before we splice it. A
+    // misordered, wrong, or corrupt signature is rejected here (fail loud)
+    // rather than producing a tx the network silently rejects at broadcast.
+    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
+    let msg = bitcoin::secp256k1::Message::from_digest(*digest);
+    secp.verify_ecdsa(&msg, &secp_sig, pubkey).map_err(|_| {
+        AdapterError::BadIntent(format!("signature {input} does not verify against its BIP143 sighash"))
+    })?;
+
+    let btc_sig = bitcoin::ecdsa::Signature::sighash_all(secp_sig);
+    // Witness for P2WPKH = [der_sig||sighash_type, compressed_pubkey].
+    let slot = tx
+        .input
+        .get_mut(input)
+        .ok_or_else(|| AdapterError::Encoding(format!("no input {input}")))?;
+    slot.witness = bitcoin::Witness::p2wpkh(&btc_sig, pubkey);
+    Ok(())
 }
 
 pub fn assemble_signed(
@@ -197,23 +248,7 @@ pub fn assemble_signed(
     // The per-input BIP143 sighashes (input order) come straight from
     // build_unsigned via `unsigned.sign_requests` — the exact digests each
     // signature must commit to. Used to self-verify every signature below.
-    let secp = bitcoin::secp256k1::Secp256k1::verification_only();
-
     for (i, sig) in sigs.iter().enumerate() {
-        // Rebuild the 64-byte compact r||s from the crate's signature type.
-        let mut compact = [0u8; 64];
-        compact[0..32].copy_from_slice(&sig.r);
-        compact[32..64].copy_from_slice(&sig.s);
-
-        let mut secp_sig = bitcoin::secp256k1::ecdsa::Signature::from_compact(&compact)
-            .map_err(|e| AdapterError::Encoding(format!("invalid compact sig input {i}: {e}")))?;
-        // BIP62 low-S: enforce in place, always (network policy rejects high-S).
-        secp_sig.normalize_s();
-
-        // SELF-VERIFY (#7): the signature MUST validate against this input's
-        // BIP143 sighash under the sender's pubkey before we splice it. A
-        // misordered, wrong, or corrupt signature is rejected here (fail loud)
-        // rather than producing a tx the network silently rejects at broadcast.
         let digest = match unsigned.sign_requests.get(i) {
             Some(SignRequest::Digest(d)) => *d,
             _ => {
@@ -222,16 +257,7 @@ pub fn assemble_signed(
                 )))
             }
         };
-        let msg = bitcoin::secp256k1::Message::from_digest(digest);
-        secp.verify_ecdsa(&msg, &secp_sig, &pubkey).map_err(|_| {
-            AdapterError::BadIntent(format!(
-                "signature {i} does not verify against its BIP143 sighash"
-            ))
-        })?;
-
-        let btc_sig = bitcoin::ecdsa::Signature::sighash_all(secp_sig);
-        // Witness for P2WPKH = [der_sig||sighash_type, compressed_pubkey].
-        tx.input[i].witness = bitcoin::Witness::p2wpkh(&btc_sig, &pubkey);
+        splice_p2wpkh_signature(&mut tx, i, sig, &pubkey, &digest)?;
     }
 
     let wire = bitcoin::consensus::serialize(&tx);

@@ -1,33 +1,42 @@
 //! Solana message build + transaction assemble (SystemProgram transfer,
 //! host-signed, Ed25519).
 //!
-//! Pinned, spike-verified API used here:
-//!   - `solana_system_interface::instruction::transfer(&from, &to, lamports)
-//!      -> solana_instruction::Instruction`
+//! Pinned API used here:
+//!   - [`transfer_instruction`]: the System Program `Transfer` instruction,
+//!     built here (its layout is fixed by the chain).
 //!   - `solana_message::Message::new_with_blockhash(&[ix], Some(&from), &blockhash)
-//!      -> Message`; `message.serialize() -> Vec<u8>` is EXACTLY the Ed25519
-//!      sign input.
-//!   - assemble: `Transaction::new_unsigned(message)` (sizes `.signatures` to
-//!      `num_required_signatures` == 1 for a single-signer transfer), then
-//!      `tx.signatures[0] = Signature::from(<[u8; 64]>)` and
-//!      `bincode::serialize(&tx)` for the broadcast-ready wire bytes.
+//!      -> Message`; `message.serialize()` (wincode) is EXACTLY the Ed25519 sign
+//!      input.
+//!   - assemble: the stored preimage is decoded back into a `Message` with
+//!      `wincode` (solana-message's own codec) to find the signer and check the
+//!      header, then the single-signer wire format is written directly:
+//!      `compact-u16(1) || signature (64) || message`.
 //!
-//! The `Message` is round-tripped from `Unsigned.preimage`, which holds
-//! `message.serialize()`. In solana-message 4.x `Message::serialize()` is
-//! `wincode::serialize` while `assemble_signed` decodes with `bincode`; the
-//! round-trip is byte-correct because wincode's ShortU16 + fixint-LE layout is
-//! identical to what serde's `bincode` reads back here for this fixed Message
-//! shape (#19 — the two encoders agree on these bytes; do NOT assume they are
-//! interchangeable in general). `btc_vectors`-style snapshot + round-trip tests
-//! guard against a future divergence.
+//! Pinned byte-for-byte against solana-web3.js's own vectors (message and
+//! signed transaction) in `tests/solana_vectors.rs`.
 
 use crate::types::*;
 
 use solana_hash::Hash;
+use solana_instruction::{AccountMeta, Instruction};
 use solana_message::Message;
 use solana_pubkey::Pubkey;
 use solana_signature::Signature;
-use solana_transaction::Transaction;
+
+/// The System Program's `Transfer` instruction, as the chain defines it: data
+/// is the instruction's index in the System Program (2) as a little-endian
+/// u32, then the lamports as a little-endian u64; accounts are the funding
+/// account (signer, writable) and the recipient (writable).
+pub fn transfer_instruction(from: &Pubkey, to: &Pubkey, lamports: u64) -> Instruction {
+    let mut data = Vec::with_capacity(12);
+    data.extend_from_slice(&2u32.to_le_bytes());
+    data.extend_from_slice(&lamports.to_le_bytes());
+    Instruction::new_with_bytes(
+        solana_sdk_ids::system_program::ID,
+        &data,
+        vec![AccountMeta::new(*from, true), AccountMeta::new(*to, false)],
+    )
+}
 
 /// Normalized intent for a single SystemProgram `transfer`. Fee payer = `from`.
 #[derive(Debug, Clone)]
@@ -69,7 +78,7 @@ pub fn build_unsigned(intent: &SolanaIntent) -> Result<Unsigned, AdapterError> {
         "recent_blockhash",
     )?);
 
-    let ix = solana_system_interface::instruction::transfer(&from_pk, &to_pk, intent.lamports);
+    let ix = transfer_instruction(&from_pk, &to_pk, intent.lamports);
 
     // Fee payer = from. new_with_blockhash builds the canonical SystemProgram
     // transfer Message; `message.serialize()` is the exact Ed25519 sign input.
@@ -78,7 +87,7 @@ pub fn build_unsigned(intent: &SolanaIntent) -> Result<Unsigned, AdapterError> {
 
     Ok(Unsigned {
         // The serialized Message is BOTH the preimage we rebuild from in
-        // assemble_signed (via bincode round-trip) AND the exact sign input.
+        // assemble_signed AND the exact sign input.
         preimage: serialized.clone(),
         sign_requests: vec![SignRequest::Message(serialized)],
     })
@@ -94,8 +103,7 @@ pub fn assemble_signed(unsigned: &Unsigned, sig64: &[u8]) -> Result<RawTx, Adapt
     })?;
 
     // Rebuild the Message from the stored preimage (== message.serialize()).
-    let message: Message = bincode::deserialize(&unsigned.preimage)
-        .map_err(|e| AdapterError::Encoding(format!("deserialize solana message: {e}")))?;
+    let message = decode_message(&unsigned.preimage)?;
 
     // SELF-VERIFY (#15): the Ed25519 signature MUST validate against the signed
     // message bytes (the preimage) under the fee-payer / signer pubkey
@@ -112,7 +120,7 @@ pub fn assemble_signed(unsigned: &Unsigned, sig64: &[u8]) -> Result<RawTx, Adapt
         ));
     }
 
-    splice_signature(message, sig_arr)
+    wire_with_signature(&message, &unsigned.preimage, sig_arr)
 }
 
 /// Assemble a transaction for the **simulate read-path ONLY**, splicing the
@@ -127,25 +135,36 @@ pub fn assemble_for_simulation(unsigned: &Unsigned, sig64: &[u8]) -> Result<RawT
             sig64.len()
         ))
     })?;
-    let message: Message = bincode::deserialize(&unsigned.preimage)
-        .map_err(|e| AdapterError::Encoding(format!("deserialize solana message: {e}")))?;
-    splice_signature(message, sig_arr)
+    let message = decode_message(&unsigned.preimage)?;
+    wire_with_signature(&message, &unsigned.preimage, sig_arr)
 }
 
-/// Splice a raw 64-byte signature into slot 0 of the transaction and serialize.
-fn splice_signature(message: Message, sig_arr: [u8; 64]) -> Result<RawTx, AdapterError> {
-    // new_unsigned sizes `.signatures` to num_required_signatures (== 1 for a
-    // single-signer transfer); splice the raw sig into slot 0.
-    let mut tx = Transaction::new_unsigned(message);
-    if tx.signatures.is_empty() {
-        return Err(AdapterError::Encoding(
-            "transaction has no signature slots".into(),
-        ));
+/// The stored preimage (`message.serialize()`) decoded back into its Message,
+/// with solana-message's own codec. Trailing bytes are refused.
+fn decode_message(preimage: &[u8]) -> Result<Message, AdapterError> {
+    let message: Message = wincode::deserialize(preimage)
+        .map_err(|e| AdapterError::Encoding(format!("deserialize solana message: {e}")))?;
+    if message.serialize() != preimage {
+        return Err(AdapterError::Encoding("solana message does not re-encode to its preimage".into()));
     }
-    tx.signatures[0] = Signature::from(sig_arr);
+    Ok(message)
+}
 
-    let wire = bincode::serialize(&tx)
-        .map_err(|e| AdapterError::Encoding(format!("serialize solana transaction: {e}")))?;
+/// The wire bytes of a single-signer transaction: the signature count as a
+/// compact-u16 (1, one byte), the 64-byte signature, then the message bytes
+/// exactly as signed. A message that requires any other number of signatures
+/// is refused: this adapter builds single-signer transfers only.
+fn wire_with_signature(message: &Message, message_bytes: &[u8], sig_arr: [u8; 64]) -> Result<RawTx, AdapterError> {
+    if message.header.num_required_signatures != 1 {
+        return Err(AdapterError::Encoding(format!(
+            "expected a single-signer message, it requires {} signatures",
+            message.header.num_required_signatures
+        )));
+    }
+    let mut wire = Vec::with_capacity(1 + 64 + message_bytes.len());
+    wire.push(1);
+    wire.extend_from_slice(&sig_arr);
+    wire.extend_from_slice(message_bytes);
     Ok(RawTx(wire))
 }
 
@@ -245,5 +264,28 @@ mod tests {
         let mut bad_bh = fixture_intent();
         bad_bh.recent_blockhash = "not valid base58!!".into();
         assert!(build_unsigned(&bad_bh).is_err());
+    }
+
+    /// The assembler writes single-signer transactions only: a message that
+    /// requires two signatures is refused, not given a zeroed second slot.
+    #[test]
+    fn a_two_signer_message_is_refused() {
+        let from = Pubkey::from([0x42; 32]);
+        let to = Pubkey::from([0x24; 32]);
+        let mut ix = transfer_instruction(&from, &to, 1_000);
+        ix.accounts[1].is_signer = true;
+        let message = Message::new_with_blockhash(&[ix], Some(&from), &Hash::new_from_array([0x11; 32]));
+        assert_eq!(message.header.num_required_signatures, 2);
+        let unsigned = Unsigned { preimage: message.serialize(), sign_requests: vec![] };
+        assert!(assemble_for_simulation(&unsigned, &[0u8; 64]).is_err());
+    }
+
+    /// A preimage that does not re-encode to itself (trailing bytes) is
+    /// refused rather than spliced.
+    #[test]
+    fn a_preimage_with_trailing_bytes_is_refused() {
+        let mut unsigned = build_unsigned(&fixture_intent()).unwrap();
+        unsigned.preimage.push(0);
+        assert!(assemble_for_simulation(&unsigned, &[0u8; 64]).is_err());
     }
 }

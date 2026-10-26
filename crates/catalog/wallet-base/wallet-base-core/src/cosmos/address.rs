@@ -2,11 +2,11 @@
 //!
 //! Implemented directly against the Cosmos spec —
 //! `bech32(hrp, ripemd160(sha256(compressed_pubkey)))` — so the address layer
-//! does NOT depend on cosmrs. `tests/cosmos_vectors.rs` cross-checks this output
-//! against cosmrs's `PublicKey::account_id`, guarding the two against drift.
+//! depends on no Cosmos library. `tests/cosmos_vectors.rs` pins its output to
+//! a recorded address and to cosmjs's published signer address.
 
 use crate::types::AdapterError;
-use k256::elliptic_curve::sec1::ToEncodedPoint;
+use k256::elliptic_curve::sec1::ToSec1Point;
 use ripemd::Ripemd160;
 use sha2::{Digest, Sha256};
 
@@ -25,7 +25,7 @@ pub fn address_from_pubkey(
     // malformed (empty/garbage) — fail closed.
     let pk = k256::PublicKey::from_sec1_bytes(pubkey_sec1_compressed)
         .map_err(|e| AdapterError::BadIntent(format!("invalid secp256k1 pubkey: {e}")))?;
-    let compressed = pk.to_encoded_point(true);
+    let compressed = pk.to_sec1_point(true);
 
     let sha = Sha256::digest(compressed.as_bytes());
     let rip = Ripemd160::digest(sha);
@@ -48,7 +48,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        sk.verifying_key().to_encoded_point(true).as_bytes().to_vec()
+        sk.verifying_key().to_sec1_point(true).as_bytes().to_vec()
     }
 
     #[test]
@@ -71,7 +71,7 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        let uncompressed = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        let uncompressed = sk.verifying_key().to_sec1_point(false).as_bytes().to_vec();
         assert_eq!(uncompressed.len(), 65);
         let from_uncompressed = address_from_pubkey(&uncompressed, "cosmos").unwrap();
         let from_compressed = address_from_pubkey(&test_pk(), "cosmos").unwrap();

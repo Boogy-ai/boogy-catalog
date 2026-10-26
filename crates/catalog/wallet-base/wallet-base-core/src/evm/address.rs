@@ -1,13 +1,13 @@
 use crate::types::AdapterError;
 use alloy_primitives::keccak256;
-use k256::{elliptic_curve::sec1::ToEncodedPoint, PublicKey};
+use k256::{elliptic_curve::sec1::ToSec1Point, PublicKey};
 
 /// EVM address = last 20 bytes of keccak256(uncompressed_pubkey[1..]) (drop 0x04 tag),
 /// EIP-55 checksummed.
 pub fn address_from_pubkey(pubkey_sec1: &[u8]) -> Result<String, AdapterError> {
     let pk = PublicKey::from_sec1_bytes(pubkey_sec1)
         .map_err(|e| AdapterError::Encoding(format!("pubkey: {e}")))?;
-    let point = pk.to_encoded_point(false); // 0x04 || X || Y
+    let point = pk.to_sec1_point(false); // 0x04 || X || Y
     let bytes = point.as_bytes();
     let hash = keccak256(&bytes[1..]); // skip 0x04
     Ok(to_checksum(&hash[12..]))

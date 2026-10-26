@@ -28,7 +28,7 @@ pub mod rpc;
 mod tx;
 
 pub use coinselect::{select_coins, Selection};
-pub use tx::{BtcIntent, Utxo};
+pub use tx::{p2wpkh_sighash, recipient_script_pubkey, splice_p2wpkh_signature, BtcIntent, Utxo};
 
 /// Bitcoin network — selects the bech32 HRP (`bc1q…` vs `tb1q…`) and gates
 /// `to_address` parsing in `build_unsigned`. Defaults to [`BtcNetwork::Mainnet`].

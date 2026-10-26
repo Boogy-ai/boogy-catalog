@@ -216,7 +216,7 @@ pub fn assemble_signed(
             .map_err(|e| AdapterError::BadIntent(format!("invalid signature scalars: {e}")))?;
         let vk = k256::ecdsa::VerifyingKey::recover_from_prehash(&digest, &ksig, rid)
             .map_err(|_| AdapterError::BadIntent("signature does not recover a key".into()))?;
-        let recovered = super::address::address_from_pubkey(vk.to_encoded_point(false).as_bytes())?;
+        let recovered = super::address::address_from_pubkey(vk.to_sec1_point(false).as_bytes())?;
         if !recovered.eq_ignore_ascii_case(resolved.from_address.trim()) {
             return Err(AdapterError::BadIntent(
                 "recovered signer does not match the wallet address".into(),
