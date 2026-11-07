@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 serde_json = { workspace = true }
+boogy-stripe-sig = { git = "https://github.com/Boogy-ai/boogy-sdk" }
 
 [lib]
 crate-type = ["rlib"]

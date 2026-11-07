@@ -269,7 +269,7 @@ sequenceDiagram
     participant JQ as Job queue
 
     Stripe->>G: POST /webhook (raw body + Stripe-Signature)
-    G->>G: stripe_sig_parts(): parse header,<br/>enforce ±300s replay tolerance,<br/>build signed message "{t}.{payload}"
+    G->>G: stripe_sig::parse(): parse header,<br/>enforce ±300s replay tolerance,<br/>build signed message "{t}.{payload}"
     G->>Host: secrets_verify_hmac_sha256(stripe_webhook_secret,<br/>signed_message, expected_hex)
     Note over Host: host KMS-unwraps the secret,<br/>computes HMAC-SHA256,<br/>constant-time compares.<br/>wasm NEVER sees the secret.
     Host-->>G: Ok(true)  ·  anything else → flat 400

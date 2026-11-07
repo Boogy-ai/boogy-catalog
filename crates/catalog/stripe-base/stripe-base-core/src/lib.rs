@@ -199,134 +199,45 @@ mod client_service_tests {
     }
 }
 
-/// Parsed pieces of a Stripe-Signature header, ready for host-side HMAC verify.
-#[derive(Debug, PartialEq)]
-pub struct StripeSigParts {
-    pub signed_message: Vec<u8>,   // b"{t}.{payload}"
-    pub expected_hex: String,      // the v1 signature
-}
+/// The shared `Stripe-Signature` parser; the webhook route calls
+/// `stripe_sig::parse`.
+pub use boogy_stripe_sig as stripe_sig;
 
-/// Parse the `Stripe-Signature` header, enforce replay tolerance, build the
-/// signed message. Returns Err on malformed header or stale timestamp.
-pub fn stripe_sig_parts(
-    payload: &[u8], sig_header: &str, now_s: i64, tolerance_s: i64,
-) -> Result<StripeSigParts, String> {
-    // The header is a comma-separated list of `key=value` elements, e.g.
-    // `t=1492774577,v1=5257a8...,v0=...`. We need `t` and the first `v1`.
-    // Parsing is total: every branch falls through to `Err`, never panics.
-    let mut t: Option<i64> = None;
-    let mut v1: Option<&str> = None;
-    for elem in sig_header.split(',') {
-        // `split_once` handles missing `=`, empty elements, and extra `=`
-        // (only the first `=` splits) without panicking.
-        let Some((key, value)) = elem.split_once('=') else {
-            continue;
-        };
-        match key {
-            "t" if t.is_none() => {
-                // Only accept a well-formed i64; bad input → leave `t` None → Err.
-                t = value.parse::<i64>().ok();
-            }
-            // Stripe may send one `v1=` per signing secret. For this MVP we
-            // take the FIRST v1 entry. Empty values are skipped so a trailing
-            // `v1=` cannot win — an empty expected signature is unsafe and must
-            // surface as Err below.
-            "v1" if v1.is_none() && !value.is_empty() => {
-                v1 = Some(value);
-            }
-            _ => {}
-        }
-    }
-
-    let t = t.ok_or_else(|| "missing or invalid timestamp".to_string())?;
-    let v1 = v1.ok_or_else(|| "missing v1 signature".to_string())?;
-
-    // Replay tolerance: absolute skew rejects both stale (too old) and
-    // absurd-future (clock-skewed forward) timestamps.
-    if (now_s - t).abs() > tolerance_s {
-        return Err("timestamp outside tolerance window".to_string());
-    }
-
-    // signed_message = b"{t}." ++ raw payload bytes. Concatenate the raw bytes
-    // so a non-UTF-8 payload is preserved exactly (no lossy String conversion).
-    let mut signed_message = format!("{t}.").into_bytes();
-    signed_message.extend_from_slice(payload);
-
-    Ok(StripeSigParts { signed_message, expected_hex: v1.to_string() })
+/// True when any `v1` signature in `signed` verifies. `verify` is handed the
+/// signed message and one candidate hex signature, and is called for each
+/// candidate in header order until one returns `true`. Stripe sends one `v1`
+/// per active signing secret, so a rotated secret is accepted whichever
+/// position its signature takes.
+pub fn any_v1_verifies<F>(signed: &stripe_sig::SignedPayload, mut verify: F) -> bool
+where
+    F: FnMut(&[u8], &str) -> bool,
+{
+    signed.v1.iter().any(|sig| verify(&signed.message, sig))
 }
 
 #[cfg(test)]
 mod sig_tests {
     use super::*;
-    #[test]
-    fn parses_and_builds_signed_message() {
-        let p = stripe_sig_parts(b"{\"id\":\"evt_1\"}", "t=1000,v1=abc123", 1000, 300).unwrap();
-        assert_eq!(p.signed_message, b"1000.{\"id\":\"evt_1\"}");
-        assert_eq!(p.expected_hex, "abc123");
-    }
-    #[test]
-    fn rejects_stale_timestamp() {
-        assert!(stripe_sig_parts(b"{}", "t=1000,v1=abc", 9999, 300).is_err());
-    }
-    #[test]
-    fn rejects_malformed_header() {
-        assert!(stripe_sig_parts(b"{}", "garbage", 1000, 300).is_err());
-    }
-
-    // ---- adversarial (security) cases ----
 
     #[test]
-    fn rejects_future_skew_beyond_tolerance() {
-        // t far in the FUTURE relative to now (diff > tolerance) → Err.
-        assert!(stripe_sig_parts(b"{}", "t=10000,v1=abc", 1000, 300).is_err());
+    fn catalog_accepts_a_rotated_secret() {
+        // The header carries a signature for the old secret first and the new
+        // one second; only the second verifies against the configured secret.
+        let signed = stripe_sig::parse("t=1000,v1=old,v1=new", b"{}", 1000, 300).unwrap();
+        let mut tried = Vec::new();
+        let ok = any_v1_verifies(&signed, |msg, sig| {
+            assert_eq!(msg, b"1000.{}");
+            tried.push(sig.to_string());
+            sig == "new"
+        });
+        assert!(ok);
+        assert_eq!(tried, ["old", "new"]);
     }
 
     #[test]
-    fn accepts_within_tolerance_both_directions() {
-        // slightly older
-        assert!(stripe_sig_parts(b"{}", "t=900,v1=abc", 1000, 300).is_ok());
-        // slightly newer
-        assert!(stripe_sig_parts(b"{}", "t=1100,v1=abc", 1000, 300).is_ok());
-    }
-
-    #[test]
-    fn rejects_missing_v1() {
-        assert!(stripe_sig_parts(b"{}", "t=1000", 1000, 300).is_err());
-    }
-
-    #[test]
-    fn rejects_missing_timestamp() {
-        assert!(stripe_sig_parts(b"{}", "v1=abc", 1000, 300).is_err());
-    }
-
-    #[test]
-    fn rejects_non_numeric_timestamp() {
-        // Must Err, never panic, on a non-numeric `t`.
-        assert!(stripe_sig_parts(b"{}", "t=notanumber,v1=abc", 1000, 300).is_err());
-    }
-
-    #[test]
-    fn signed_message_preserves_raw_payload_bytes() {
-        // Payload that is NOT valid UTF-8 must be concatenated byte-for-byte.
-        let payload = &[0x7b, 0xff, 0x7d];
-        let p = stripe_sig_parts(payload, "t=1000,v1=abc", 1000, 300).unwrap();
-        let mut expected = b"1000.".to_vec();
-        expected.extend_from_slice(payload);
-        assert_eq!(p.signed_message, expected);
-    }
-
-    #[test]
-    fn empty_v1_value_rejected_or_handled() {
-        // An empty expected signature is unsafe; reject it.
-        assert!(stripe_sig_parts(b"{}", "t=1000,v1=", 1000, 300).is_err());
-    }
-
-    #[test]
-    fn tolerance_zero_requires_exact() {
-        // tolerance 0: exact match is Ok, ±1 is Err.
-        assert!(stripe_sig_parts(b"{}", "t=1000,v1=abc", 1000, 0).is_ok());
-        assert!(stripe_sig_parts(b"{}", "t=1001,v1=abc", 1000, 0).is_err());
-        assert!(stripe_sig_parts(b"{}", "t=999,v1=abc", 1000, 0).is_err());
+    fn no_matching_v1_is_refused() {
+        let signed = stripe_sig::parse("t=1000,v1=a,v1=b", b"{}", 1000, 300).unwrap();
+        assert!(!any_v1_verifies(&signed, |_, _| false));
     }
 }
 

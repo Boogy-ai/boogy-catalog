@@ -6,7 +6,7 @@
 //! applies signature-verified completion webhooks durably. Pure logic (Stripe
 //! checkout form-body shaping, `Stripe-Signature` parsing + signed-message
 //! construction + replay tolerance) lives in the host-testable sibling crate
-//! `stripe-base-core` (`stripe_base_core::{checkout_form_body, stripe_sig_parts}`).
+//! `stripe-base-core` (`stripe_base_core::{checkout_form_body, stripe_sig, any_v1_verifies}`).
 //!
 //! ## Multi-client-service model
 //!
@@ -1196,12 +1196,13 @@ const SIG_TOLERANCE_S: i64 = 300;
 ///
 /// Flow (fast-path, work is durable in the `apply_webhook` job):
 /// 1. Read the RAW body bytes + the `Stripe-Signature` header (missing → 400).
-/// 2. `stripe_base_core::stripe_sig_parts` parses the header, enforces the replay
-///    tolerance, and builds the signed message `"{t}.{payload}"` + the
-///    expected hex MAC (malformed / stale / missing `t`/`v1` → 400).
+/// 2. `stripe_base_core::stripe_sig::parse` parses the header, enforces the
+///    replay tolerance, and builds the signed message `"{t}.{payload}"` + every
+///    `v1` hex MAC (malformed / stale / missing `t`/`v1` → 400).
 /// 3. **HOST-VERIFY**: `secrets_verify_hmac_sha256` has the host compute the
 ///    HMAC over the signed message with the KMS-wrapped `stripe_webhook_secret`
-///    and constant-time-compare it to the expected hex. The wasm NEVER sees the
+///    and constant-time-compare it to each `v1`; any match accepts (a rotated
+///    secret signs a second `v1`). The wasm NEVER sees the
 ///    secret. `Ok(false)` (forged) → 400; `Err(..)` (unknown/internal) → 400
 ///    (fail-closed; we do not leak which). A bad/forged signature therefore
 ///    never reaches dedupe or enqueue.
@@ -1237,21 +1238,23 @@ fn webhook(req: &mut Req<'_>) -> Result<Json<WebhookAck>, ApiError> {
     //    Any malformed/stale header is a flat 400 — we deliberately do not echo
     //    the parser's reason (avoid leaking which check failed).
     let now_s = (now_millis() / 1000) as i64;
-    let parts = stripe_base_core::stripe_sig_parts(&body, &sig_header, now_s, SIG_TOLERANCE_S)
+    let signed = stripe_base_core::stripe_sig::parse(&sig_header, &body, now_s, SIG_TOLERANCE_S)
         .map_err(|_| ApiError::bad_request("invalid Stripe-Signature header"))?;
 
     // 3. HOST-VERIFY the HMAC against the KMS-wrapped `stripe_webhook_secret`.
     //    The wasm never sees the secret. Anything but Ok(true) is a flat 400 so
     //    a forged signature and an unavailable/unknown secret are
     //    indistinguishable to the caller — and neither reaches dedupe/enqueue.
-    match crate::secrets_verify_hmac_sha256(
-        "stripe_webhook_secret",
-        &parts.signed_message,
-        &parts.expected_hex,
-    ) {
-        Ok(true) => { /* verified — proceed */ }
-        Ok(false) => return Err(ApiError::bad_request("signature verification failed")),
-        Err(_) => return Err(ApiError::bad_request("signature verification failed")),
+    //    Stripe sends one `v1` per active signing secret (two during a
+    //    rotation), so the event is accepted when ANY of them verifies.
+    let verified = stripe_base_core::any_v1_verifies(&signed, |message, sig| {
+        matches!(
+            crate::secrets_verify_hmac_sha256("stripe_webhook_secret", message, sig),
+            Ok(true)
+        )
+    });
+    if !verified {
+        return Err(ApiError::bad_request("signature verification failed"));
     }
 
     // 4. Parse the Stripe event envelope: `id` (event id, the dedupe key) +
