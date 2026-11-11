@@ -92,7 +92,7 @@ CLI from the SDK repo.
 
 Expert skills for building Boogy services are published as agent skills.
 **Claude Code (preferred):** `claude plugin marketplace add Boogy-ai/boogy-superpowers` then
-`claude plugin install boogy-superpowers` — bundles skills + MCP + onramp gate; tell the human
+`claude plugin install boogy@boogy` — bundles skills + MCP + onramp gate; tell the human
 to run **`/reload-plugins`** so the plugin activates mid-session.
 **Other agents / vendor route:** `boogy skills install` (or `npx degit Boogy-ai/boogy-superpowers/skills
 .claude/skills` — flat, no wrapper suffix); skills load automatically — if `.claude/skills/` was just
